@@ -15,6 +15,17 @@ try:
 except ImportError:
     pass  # We'll handle the absence of these packages later
 
+# Try to import scikit-bio for Neighbor-Joining trees
+SKBIO_AVAILABLE = False
+try:
+    import skbio
+    from skbio import DistanceMatrix
+    from skbio.tree import nj, TreeNode # TreeNode for type hinting if needed
+    import random # for bootstrapping
+    SKBIO_AVAILABLE = True
+except ImportError:
+    pass
+
 def parse_fgr_file(filepath):
     """
     Parses an .fgr file and returns a set of k-mers and a dictionary of k-mer:coverage.
@@ -163,10 +174,12 @@ def plot_and_save_dendrogram(distance_matrix, labels, tree_type, output_path_pre
         print(f"Labels: {labels}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Calculate Jaccard Index and Cosine Similarity between .fgr files, and optionally plot relationship trees.")
+    parser = argparse.ArgumentParser(description="Calculate Jaccard Index and Cosine Similarity between .fgr files, and optionally plot relationship trees and build Neighbor-Joining trees.")
     parser.add_argument("directory", nargs='?', default=".", help="Directory containing .fgr files (default: current directory)")
-    parser.add_argument("-o", "--output_prefix", help="Output prefix for similarity matrix and dendrogram files. If provided, matrices and plots are saved to files.")
-    parser.add_argument("--plot_trees", action='store_true', help="Enable generation of relationship trees (dendrograms).")
+    parser.add_argument("-o", "--output_prefix", help="Output prefix for similarity matrix and dendrogram/tree files. If provided, matrices and plots/trees are saved to files.")
+    parser.add_argument("--plot_trees", action='store_true', help="Enable generation of hierarchical clustering relationship trees (dendrograms).")
+    parser.add_argument("--nj_tree", action='store_true', help="Enable generation of Neighbor-Joining trees (requires scikit-bio).")
+    parser.add_argument("--bootstrap_replicates", type=int, default=100, help="Number of bootstrap replicates for Neighbor-Joining trees (default: 100). Only used if --nj_tree is specified.")
     args = parser.parse_args()
 
     # Check if plotting is requested but not available
@@ -261,19 +274,194 @@ def main():
     if args.plot_trees and PLOTTING_AVAILABLE:
         print("\n--- Generating Relationship Trees (Dendrograms) ---")
         # Convert similarity to distance (1 - similarity)
-        jaccard_distance_matrix = 1 - jaccard_matrix
-        cosine_distance_matrix = 1 - cosine_matrix
+        jaccard_distance_matrix_for_dendro = 1 - jaccard_matrix
+        cosine_distance_matrix_for_dendro = 1 - cosine_matrix
 
         # Ensure diagonal is 0 for distance matrices
-        np.fill_diagonal(jaccard_distance_matrix, 0)
-        np.fill_diagonal(cosine_distance_matrix, 0)
+        np.fill_diagonal(jaccard_distance_matrix_for_dendro, 0)
+        np.fill_diagonal(cosine_distance_matrix_for_dendro, 0)
 
         # Plot Jaccard Dendrogram
         if num_files >=2:
-            plot_and_save_dendrogram(jaccard_distance_matrix, file_basenames, "Jaccard", args.output_prefix)
-            plot_and_save_dendrogram(cosine_distance_matrix, file_basenames, "Cosine", args.output_prefix)
+            plot_and_save_dendrogram(jaccard_distance_matrix_for_dendro, file_basenames, "Jaccard", args.output_prefix)
+            plot_and_save_dendrogram(cosine_distance_matrix_for_dendro, file_basenames, "Cosine", args.output_prefix)
         else:
             print("Skipping dendrogram generation as there are less than 2 files to compare.")
+
+    # --- Neighbor-Joining Tree Generation ---
+    if args.nj_tree:
+        if not SKBIO_AVAILABLE:
+            print("\nWARNING: You requested Neighbor-Joining trees (--nj_tree) but scikit-bio is not installed.")
+            print("Please install it using: pip install scikit-bio")
+            print("Skipping NJ tree generation.")
+        elif num_files < 2:
+            print("\nSkipping Neighbor-Joining tree generation as there are less than 2 files to compare.")
+        else:
+            print("\n--- Generating Neighbor-Joining Trees ---")
+            
+            # Distance matrices (1 - similarity)
+            # These are the full distance matrices based on all k-mers
+            nj_jaccard_dist_matrix_np = 1 - jaccard_matrix
+            nj_cosine_dist_matrix_np = 1 - cosine_matrix
+            np.fill_diagonal(nj_jaccard_dist_matrix_np, 0)
+            np.fill_diagonal(nj_cosine_dist_matrix_np, 0)
+
+            # Prepare k-mer data for bootstrapping
+            all_unique_kmers = set()
+            if args.bootstrap_replicates > 0:
+                for f_path in valid_file_paths: # Use valid_file_paths to get original kmer sets
+                    kmers_set, _ = file_data[f_path]
+                    all_unique_kmers.update(kmers_set)
+                all_unique_kmers_list = list(all_unique_kmers)
+                if not all_unique_kmers_list:
+                    print("Warning: No k-mers found across all samples. Cannot perform bootstrap for NJ trees.")
+                    # Proceed without bootstrapping if no k-mers
+                    current_bootstrap_replicates = 0
+                else:
+                    current_bootstrap_replicates = args.bootstrap_replicates
+            else:
+                current_bootstrap_replicates = 0
+
+            # --- Process Jaccard Distances for NJ Tree ---
+            print("\nProcessing Jaccard distances for NJ tree...")
+            try:
+                skbio_jaccard_dm_orig = DistanceMatrix(nj_jaccard_dist_matrix_np, ids=file_basenames)
+                
+                if current_bootstrap_replicates > 0:
+                    print(f"Running {current_bootstrap_replicates} bootstrap replicates for Jaccard NJ tree...")
+                    jaccard_bootstrap_trees = []
+                    for i in range(current_bootstrap_replicates):
+                        if (i + 1) % 10 == 0 or i == current_bootstrap_replicates - 1:
+                             print(f"  Bootstrap replicate {i+1}/{current_bootstrap_replicates}...")
+                        
+                        # Create bootstrapped k-mer universe
+                        current_bootstrap_kmer_universe = set(random.choices(all_unique_kmers_list, k=len(all_unique_kmers_list)))
+                        
+                        boot_j_distances = np.zeros((num_files, num_files))
+                        
+                        for r_idx in range(num_files): # row index
+                            for c_idx in range(r_idx + 1, num_files): # column index
+                                path1 = valid_file_paths[r_idx]
+                                path2 = valid_file_paths[c_idx]
+                                
+                                kmers1_orig, _ = file_data[path1]
+                                kmers2_orig, _ = file_data[path2]
+
+                                kmers1_boot = kmers1_orig.intersection(current_bootstrap_kmer_universe)
+                                kmers2_boot = kmers2_orig.intersection(current_bootstrap_kmer_universe)
+                                
+                                ji_boot = jaccard_index(kmers1_boot, kmers2_boot)
+                                dist_boot = 1.0 - ji_boot
+                                
+                                boot_j_distances[r_idx, c_idx] = dist_boot
+                                boot_j_distances[c_idx, r_idx] = dist_boot
+                        
+                        skbio_boot_j_dm = DistanceMatrix(boot_j_distances, ids=file_basenames)
+                        
+                        try:
+                            if skbio_boot_j_dm.shape[0] >= 2:
+                                if np.all(np.isclose(skbio_boot_j_dm.data, 0)) and skbio_boot_j_dm.shape[0] > 1 :
+                                    # print(f"Warning: Jaccard Bootstrap replicate {i+1} resulted in all-zero distances. Skipping.")
+                                    continue
+                                if np.any(np.isnan(skbio_boot_j_dm.data)) or np.any(np.isinf(skbio_boot_j_dm.data)):
+                                    # print(f"Warning: Jaccard Bootstrap replicate {i+1} resulted in NaN/Inf distances. Skipping.")
+                                    continue
+                                boot_tree = nj(skbio_boot_j_dm, disallow_negative_branch_length=True)
+                                jaccard_bootstrap_trees.append(boot_tree)
+                        except Exception as e_nj_boot:
+                            # print(f"Warning: Could not build NJ tree for Jaccard bootstrap replicate {i+1}. Error: {e_nj_boot}. Skipping.")
+                            pass # Fail silently for individual bootstrap replicates to avoid flooding console
+
+                    if jaccard_bootstrap_trees:
+                        # assign_supports=True will assign node.support = proportion of trees containing the bipartition
+                        # A specific tree isn't used as the 'reference' for majority_consensus; it derives a new one.
+                        final_tree_j = skbio.tree.majority_consensus(jaccard_bootstrap_trees, cutoff=0.0, assign_supports=True)
+                        print("Jaccard NJ consensus tree with bootstrap supports generated.")
+                    else:
+                        print("No Jaccard bootstrap trees were successfully generated. Building NJ tree on original data without supports.")
+                        final_tree_j = nj(skbio_jaccard_dm_orig, disallow_negative_branch_length=True)
+                else: # No bootstrapping
+                    final_tree_j = nj(skbio_jaccard_dm_orig, disallow_negative_branch_length=True)
+                    print("Jaccard NJ tree (no bootstrap) generated.")
+
+                if args.output_prefix:
+                    nj_j_output_path = args.output_prefix + ".jaccard.nj.newick"
+                    final_tree_j.write(nj_j_output_path)
+                    print(f"Jaccard NJ tree saved to {nj_j_output_path}")
+                else:
+                    print("\nJaccard Neighbor-Joining Tree (Newick format):")
+                    print(final_tree_j.format_newick())
+            except Exception as e_nj_main_j:
+                print(f"Error during Jaccard NJ tree construction: {e_nj_main_j}")
+
+
+            # --- Process Cosine Distances for NJ Tree ---
+            print("\nProcessing Cosine distances for NJ tree...")
+            try:
+                skbio_cosine_dm_orig = DistanceMatrix(nj_cosine_dist_matrix_np, ids=file_basenames)
+
+                if current_bootstrap_replicates > 0:
+                    print(f"Running {current_bootstrap_replicates} bootstrap replicates for Cosine NJ tree...")
+                    cosine_bootstrap_trees = []
+                    for i in range(current_bootstrap_replicates):
+                        if (i + 1) % 10 == 0 or i == current_bootstrap_replicates -1:
+                            print(f"  Bootstrap replicate {i+1}/{current_bootstrap_replicates}...")
+
+                        current_bootstrap_kmer_universe = set(random.choices(all_unique_kmers_list, k=len(all_unique_kmers_list)))
+                        boot_c_distances = np.zeros((num_files, num_files))
+
+                        for r_idx in range(num_files): # row index
+                            for c_idx in range(r_idx + 1, num_files): # column index
+                                path1 = valid_file_paths[r_idx]
+                                path2 = valid_file_paths[c_idx]
+
+                                _, cov1_orig = file_data[path1]
+                                _, cov2_orig = file_data[path2]
+
+                                cov1_boot = {k: v for k, v in cov1_orig.items() if k in current_bootstrap_kmer_universe}
+                                cov2_boot = {k: v for k, v in cov2_orig.items() if k in current_bootstrap_kmer_universe}
+
+                                cs_boot = cosine_similarity_manual(cov1_boot, cov2_boot)
+                                dist_boot = 1.0 - cs_boot
+                                
+                                boot_c_distances[r_idx, c_idx] = dist_boot
+                                boot_c_distances[c_idx, r_idx] = dist_boot
+                        
+                        skbio_boot_c_dm = DistanceMatrix(boot_c_distances, ids=file_basenames)
+                        try:
+                            if skbio_boot_c_dm.shape[0] >= 2:
+                                if np.all(np.isclose(skbio_boot_c_dm.data, 0)) and skbio_boot_c_dm.shape[0] > 1:
+                                    # print(f"Warning: Cosine Bootstrap replicate {i+1} resulted in all-zero distances. Skipping.")
+                                    continue
+                                if np.any(np.isnan(skbio_boot_c_dm.data)) or np.any(np.isinf(skbio_boot_c_dm.data)):
+                                    # print(f"Warning: Cosine Bootstrap replicate {i+1} resulted in NaN/Inf distances. Skipping.")
+                                    continue
+                                boot_tree = nj(skbio_boot_c_dm, disallow_negative_branch_length=True)
+                                cosine_bootstrap_trees.append(boot_tree)
+                        except Exception as e_nj_boot_c:
+                            # print(f"Warning: Could not build NJ tree for Cosine bootstrap replicate {i+1}. Error: {e_nj_boot_c}. Skipping.")
+                            pass
+
+                    if cosine_bootstrap_trees:
+                        final_tree_c = skbio.tree.majority_consensus(cosine_bootstrap_trees, cutoff=0.0, assign_supports=True)
+                        print("Cosine NJ consensus tree with bootstrap supports generated.")
+                    else:
+                        print("No Cosine bootstrap trees were successfully generated. Building NJ tree on original data without supports.")
+                        final_tree_c = nj(skbio_cosine_dm_orig, disallow_negative_branch_length=True)
+                else: # No bootstrapping
+                    final_tree_c = nj(skbio_cosine_dm_orig, disallow_negative_branch_length=True)
+                    print("Cosine NJ tree (no bootstrap) generated.")
+
+                if args.output_prefix:
+                    nj_c_output_path = args.output_prefix + ".cosine.nj.newick"
+                    final_tree_c.write(nj_c_output_path)
+                    print(f"Cosine NJ tree saved to {nj_c_output_path}")
+                else:
+                    print("\nCosine Neighbor-Joining Tree (Newick format):")
+                    print(final_tree_c.format_newick())
+            except Exception as e_nj_main_c:
+                print(f"Error during Cosine NJ tree construction: {e_nj_main_c}")
+
 
 if __name__ == "__main__":
     main() 

@@ -7,11 +7,24 @@ import glob
 import sys
 from concurrent.futures import ProcessPoolExecutor
 
-def process_file(input_file, options):
-    """Process a single input file with fgr2"""
+def process_file_group(input_file_group, group_index, options):
+    """Process a group of input files with a single fgr2 call"""
+    if not input_file_group:
+        print(f"Warning: Empty file group received for index {group_index}. Skipping.", file=sys.stderr)
+        return False
+    
+    first_file_in_group = input_file_group[0]
+    first_file_basename = os.path.basename(first_file_in_group)
+
     try:
-        # Create output filename according to the specified pattern
-        output_filename = f".{input_file}c{options['coverage']}.fgr2.mm.fgr"
+        # Determine hash suffix for filename
+        hash_suffix = "wang" if options['wang_hash'] else "mm3"
+
+        # Create output filename
+        if len(input_file_group) > 1:
+            output_filename = f"{first_file_basename}_group{group_index + 1}.c{options['coverage']}.{hash_suffix}.fgr2"
+        else:
+            output_filename = f"{first_file_basename}.c{options['coverage']}.{hash_suffix}.fgr2"
         
         # Get the directory where this script is located
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -29,67 +42,81 @@ def process_file(input_file, options):
             "-o", output_filename
         ]
         
-        # Add wang hash option if specified
         if options['wang_hash']:
             cmd.append("-w")
             
-        # Add the input file
-        cmd.append(input_file)
+        # Add all input files in the group
+        cmd.extend(input_file_group)
         
-        # Print the command being executed
-        print(f"Running: {' '.join(cmd)}")
+        group_name_for_log = f"group {group_index + 1} (first file: {first_file_basename})"
+        print(f"Running for {group_name_for_log}: {' '.join(cmd)}")
         
-        # Execute the command
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
         
-        # Check for errors
         if result.returncode != 0:
-            print(f"Error processing {input_file}:", file=sys.stderr)
+            print(f"Error processing {group_name_for_log}:", file=sys.stderr)
             print(result.stderr, file=sys.stderr)
+            if result.stdout: # Also print stdout if fgr2 writes errors there
+                print(result.stdout, file=sys.stderr)
             return False
         
-        print(f"Successfully processed {input_file} -> {output_filename}")
+        print(f"Successfully processed {group_name_for_log} -> {output_filename}")
         return True
     
     except Exception as e:
-        print(f"Exception while processing {input_file}: {e}", file=sys.stderr)
+        error_group_name = f"group {group_index + 1} (first file: {first_file_basename})" if input_file_group else f"group {group_index + 1}"
+        print(f"Exception while processing {error_group_name}: {e}", file=sys.stderr)
         return False
 
+def _process_file_group_wrapper(args_tuple):
+    """Helper function to unpack arguments for ProcessPoolExecutor.map"""
+    return process_file_group(*args_tuple)
+
 def main():
-    parser = argparse.ArgumentParser(description="Run fgr2 on multiple input files")
+    parser = argparse.ArgumentParser(description="Run fgr2 on multiple input files, potentially in groups.")
     parser.add_argument("input_files", nargs='+', help="Input files or glob patterns")
     parser.add_argument("-k", "--kmer-size", type=int, default=31, help="K-mer size (default: 31)")
-    parser.add_argument("-t", "--threads", type=int, default=4, help="Number of threads per file (default: 4)")
+    parser.add_argument("-t", "--threads", type=int, default=4, help="Number of threads per fgr2 call (default: 4)")
     parser.add_argument("-c", "--coverage", type=int, default=2, help="Coverage cutoff for k-mers (default: 2)")
     parser.add_argument("-N", "--topn", type=int, default=10000, help="Number of top k-mers to include (default: 10000)")
     parser.add_argument("-w", "--wang-hash", action="store_true", help="Use Wang's hash function (default: MurmurHash3)")
-    parser.add_argument("-p", "--parallel", type=int, default=1, help="Number of files to process in parallel (default: 1)")
+    parser.add_argument("-p", "--parallel", type=int, default=1, help="Number of fgr2 processes to run in parallel (default: 1)")
+    parser.add_argument("-g", "--group-size", type=int, default=1, help="Number of input files per fgr2 call. Output files will have .mgr2 extension. (default: 1)")
     
     args = parser.parse_args()
     
-    # Expand any glob patterns in the input files
+    if args.group_size <= 0:
+        print("Warning: --group-size must be positive. Defaulting to 1.", file=sys.stderr)
+        args.group_size = 1
+        
     expanded_files = []
     for pattern in args.input_files:
         matches = glob.glob(pattern)
         if matches:
             expanded_files.extend(matches)
         else:
-            expanded_files.append(pattern)  # Keep the original if no matches
+            # If glob doesn't match, assume it's a literal filename
+            if os.path.exists(pattern):
+                expanded_files.append(pattern)
+            else:
+                print(f"Warning: Input pattern '{pattern}' did not match any files and is not an existing file. Skipping.", file=sys.stderr)
     
-    # Remove duplicates while preserving order
     files_to_process = []
-    for file in expanded_files:
-        if file not in files_to_process:
-            files_to_process.append(file)
+    for file_path in expanded_files:
+        if file_path not in files_to_process: # Avoid duplicates
+            files_to_process.append(file_path)
     
-    # Check that we have files to process
     if not files_to_process:
-        print("No input files found.", file=sys.stderr)
+        print("No input files found to process.", file=sys.stderr)
         return 1
     
-    print(f"Found {len(files_to_process)} files to process")
-    
-    # Create options dictionary
+    print(f"Found {len(files_to_process)} unique files to process.")
+
+    # Group files
+    grouped_files_list = [files_to_process[i:i + args.group_size] for i in range(0, len(files_to_process), args.group_size)]
+    num_groups = len(grouped_files_list)
+    print(f"Processing in {num_groups} group(s) of up to {args.group_size} file(s) each.")
+
     options = {
         'kmer_size': args.kmer_size,
         'threads': args.threads,
@@ -98,21 +125,24 @@ def main():
         'wang_hash': args.wang_hash
     }
     
-    # Process files (in parallel if requested)
     success_count = 0
-    if args.parallel > 1:
-        print(f"Processing up to {args.parallel} files in parallel")
+    if args.parallel > 1 and num_groups > 1:
+        print(f"Processing up to {args.parallel} groups in parallel.")
+        # Prepare arguments for each task: (input_file_group, group_index, options_dict)
+        tasks = [(group, idx, options) for idx, group in enumerate(grouped_files_list)]
         with ProcessPoolExecutor(max_workers=args.parallel) as executor:
-            results = list(executor.map(lambda f: process_file(f, options), files_to_process))
+            results = list(executor.map(_process_file_group_wrapper, tasks))
             success_count = sum(1 for r in results if r)
     else:
-        for file in files_to_process:
-            if process_file(file, options):
+        if args.parallel > 1 and num_groups <=1:
+            print("Note: Parallel processing > 1 specified, but only one group to process. Running sequentially.")
+        for idx, group in enumerate(grouped_files_list):
+            if process_file_group(group, idx, options):
                 success_count += 1
     
-    print(f"Completed: {success_count}/{len(files_to_process)} files processed successfully")
+    print(f"Completed: {success_count}/{num_groups} groups processed successfully.")
     
-    return 0 if success_count == len(files_to_process) else 1
+    return 0 if success_count == num_groups else 1
 
 if __name__ == "__main__":
     sys.exit(main()) 

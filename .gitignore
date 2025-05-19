@@ -53,4 +53,9 @@ dkms.conf
 
 fgr
 fgr2
+*.fgr
+*.fgr2
 *.1
+input_files/
+fq_files
+
