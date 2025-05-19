@@ -10,7 +10,7 @@
 KSEQ_INIT(gzFile, gzread)
 
 #include "khashl.h" // hash table
-#define KC_BITS 10
+#define KC_BITS 14
 #define KC_MAX ((1<<KC_BITS) - 1)
 #define kc_c4_eq(a, b) ((a)>>KC_BITS == (b)>>KC_BITS) // lower 8 bits for counts; higher bits for k-mer
 #define kc_c4_hash(a) ((a)>>KC_BITS)
@@ -340,7 +340,7 @@ static kc_c4x_t *count_file(const char *fn, int k, int p, int block_size, int n_
 }
 
 typedef struct {
-	uint64_t c[256];
+	uint64_t *c; // Changed from c[256]
 } buf_cnt_t;
 
 typedef struct {
@@ -357,25 +357,57 @@ static void worker_hist(void *data, long i, int tid) // callback for kt_for()
 	for (k = 0; k < kh_end(g); ++k)
 		if (kh_exist(g, k)) {
 			int c = kh_key(g, k) & KC_MAX;
-			++cnt[c < 255? c : 255];
+			++cnt[c];
 		}
 }
 
 static void print_hist(const kc_c4x_t *h, int n_thread)
 {
 	hist_aux_t a;
-	uint64_t cnt[256];
+	uint64_t *cnt = NULL;
 	int i, j;
+	const int hist_size = 1 << KC_BITS;
+
+	CALLOC(cnt, hist_size);
+	if (!cnt) { 
+		perror("Failed to allocate memory for histogram"); 
+		return; 
+	}
+
 	a.h = h;
 	CALLOC(a.cnt, n_thread);
+	if (!a.cnt) {
+		perror("Failed to allocate memory for thread histograms");
+		free(cnt);
+		return;
+	}
+
+	for (j = 0; j < n_thread; ++j) {
+		CALLOC(a.cnt[j].c, hist_size);
+		if (!a.cnt[j].c) {
+			perror("Failed to allocate memory for a thread's histogram buffer");
+			for (int k_idx = 0; k_idx < j; ++k_idx) free(a.cnt[k_idx].c);
+			free(a.cnt);
+			free(cnt);
+			return;
+		}
+	}
+
 	kt_for(n_thread, worker_hist, &a, 1<<h->p);
-	for (i = 0; i < 256; ++i) cnt[i] = 0;
-	for (j = 0; j < n_thread; ++j)
-		for (i = 0; i < 256; ++i)
+
+	for (j = 0; j < n_thread; ++j) {
+		for (i = 0; i < hist_size; ++i)
 			cnt[i] += a.cnt[j].c[i];
+		free(a.cnt[j].c);
+	}
 	free(a.cnt);
-	for (i = 1; i < 256; ++i)
-		printf("%d\t%ld\n", i, (long)cnt[i]);
+
+	for (i = 1; i < hist_size; ++i) {
+		if (cnt[i] > 0) {
+			printf("%d\t%ld\n", i, (long)cnt[i]);
+		}
+	}
+	free(cnt);
 }
 
 // Function to convert k-mer integer to sequence

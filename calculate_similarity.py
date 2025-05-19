@@ -176,10 +176,14 @@ def main():
         print("Continuing with similarity calculation only...\n")
 
     fgr_dir = args.directory
-    fgr_files_paths = sorted(glob.glob(os.path.join(fgr_dir, "*.fgr"))) 
+    # Find both .fgr and .fgr2 files
+    fgr_files_paths1 = glob.glob(os.path.join(fgr_dir, "*.fgr"))
+    fgr_files_paths2 = glob.glob(os.path.join(fgr_dir, "*.fgr2"))
+    # Combine and sort, removing duplicates
+    fgr_files_paths = sorted(list(set(fgr_files_paths1 + fgr_files_paths2)))
 
     if len(fgr_files_paths) < 2:
-        print("Need at least two .fgr files to compare.")
+        print("Need at least two .fgr or .fgr2 files to compare.")
         return
 
     print(f"Found {len(fgr_files_paths)} .fgr files in '{os.path.abspath(fgr_dir)}':")
