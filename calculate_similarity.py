@@ -17,12 +17,21 @@ except ImportError:
 
 # Try to import scikit-bio for Neighbor-Joining trees
 SKBIO_AVAILABLE = False
+SKBIO_MAJORITY_CONSENSUS_AVAILABLE = False
 try:
     import skbio
     from skbio import DistanceMatrix
     from skbio.tree import nj, TreeNode # TreeNode for type hinting if needed
     import random # for bootstrapping
     SKBIO_AVAILABLE = True
+    
+    # Check if majority_consensus is available
+    try:
+        from skbio.tree import majority_consensus
+        SKBIO_MAJORITY_CONSENSUS_AVAILABLE = True
+    except (ImportError, AttributeError):
+        # majority_consensus not available in this version of scikit-bio
+        pass
 except ImportError:
     pass
 
@@ -375,7 +384,15 @@ def main():
                     if jaccard_bootstrap_trees:
                         # assign_supports=True will assign node.support = proportion of trees containing the bipartition
                         # A specific tree isn't used as the 'reference' for majority_consensus; it derives a new one.
-                        final_tree_j = skbio.tree.majority_consensus(jaccard_bootstrap_trees, cutoff=0.0, assign_supports=True)
+                        if SKBIO_MAJORITY_CONSENSUS_AVAILABLE:
+                            try:
+                                final_tree_j = majority_consensus(jaccard_bootstrap_trees, cutoff=0.0, assign_supports=True)
+                            except Exception as e:
+                                print(f"Error using majority_consensus: {e}")
+                                print("Falling back to simple consensus method...")
+                                final_tree_j = simple_consensus_tree_with_supports(jaccard_bootstrap_trees, file_basenames)
+                        else:
+                            final_tree_j = simple_consensus_tree_with_supports(jaccard_bootstrap_trees, file_basenames)
                         print("Jaccard NJ consensus tree with bootstrap supports generated.")
                     else:
                         print("No Jaccard bootstrap trees were successfully generated. Building NJ tree on original data without supports.")
@@ -443,7 +460,15 @@ def main():
                             pass
 
                     if cosine_bootstrap_trees:
-                        final_tree_c = skbio.tree.majority_consensus(cosine_bootstrap_trees, cutoff=0.0, assign_supports=True)
+                        if SKBIO_MAJORITY_CONSENSUS_AVAILABLE:
+                            try:
+                                final_tree_c = majority_consensus(cosine_bootstrap_trees, cutoff=0.0, assign_supports=True)
+                            except Exception as e:
+                                print(f"Error using majority_consensus: {e}")
+                                print("Falling back to simple consensus method...")
+                                final_tree_c = simple_consensus_tree_with_supports(cosine_bootstrap_trees, file_basenames)
+                        else:
+                            final_tree_c = simple_consensus_tree_with_supports(cosine_bootstrap_trees, file_basenames)
                         print("Cosine NJ consensus tree with bootstrap supports generated.")
                     else:
                         print("No Cosine bootstrap trees were successfully generated. Building NJ tree on original data without supports.")
@@ -462,6 +487,63 @@ def main():
             except Exception as e_nj_main_c:
                 print(f"Error during Cosine NJ tree construction: {e_nj_main_c}")
 
+
+# Custom function to build a simple consensus tree when skbio.tree.majority_consensus is not available
+def simple_consensus_tree_with_supports(bootstrap_trees, ids):
+    """
+    A simplified approach to build a consensus tree with supports when skbio.tree.majority_consensus
+    is not available. This uses the first tree as a reference and annotates it with support values.
+    
+    Parameters:
+    -----------
+    bootstrap_trees : list of TreeNode objects
+        The bootstrap trees to consensus
+    ids : list of str
+        The IDs/labels for the tree leaves
+        
+    Returns:
+    --------
+    TreeNode
+        A tree with branch support values
+    """
+    if not bootstrap_trees:
+        return None
+    
+    # Use the first tree as the reference
+    reference_tree = bootstrap_trees[0].copy()
+    
+    # Create a dict to track bipartitions across all trees
+    bipartition_counts = {}
+    total_trees = len(bootstrap_trees)
+    
+    # Function to get all bipartitions in a tree
+    def get_bipartitions(tree):
+        bipartitions = []
+        for node in tree.non_tips():
+            # Get all tip names descending from this node
+            tips = {tip.name for tip in node.tips()}
+            # Convert to a frozenset for hashing (order doesn't matter for bipartitions)
+            bipartition = frozenset(tips)
+            bipartitions.append((node, bipartition))
+        return bipartitions
+    
+    # Count the frequency of each bipartition across bootstrap trees
+    for tree in bootstrap_trees:
+        for _, bipartition in get_bipartitions(tree):
+            # Only count bipartitions that don't include all tips
+            if len(bipartition) < len(ids) and len(bipartition) > 1:
+                if bipartition in bipartition_counts:
+                    bipartition_counts[bipartition] += 1
+                else:
+                    bipartition_counts[bipartition] = 1
+    
+    # Annotate the reference tree with support values
+    for node, bipartition in get_bipartitions(reference_tree):
+        if bipartition in bipartition_counts:
+            support = bipartition_counts[bipartition] / total_trees
+            node.support = support
+    
+    return reference_tree
 
 if __name__ == "__main__":
     main() 

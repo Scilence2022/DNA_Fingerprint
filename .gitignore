@@ -61,3 +61,6 @@ fq_files
 *.cos
 *.jac
 *.png
+
+finger_print_data
+
