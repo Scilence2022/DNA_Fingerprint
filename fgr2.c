@@ -145,11 +145,17 @@ uint64_t MurmurHash3_x64_64(const void* key, int len, uint64_t seed)
 
     switch (len & 7) {
     case 7: k1 ^= ((uint64_t)tail[6]) << 48;
+            /* FALLTHROUGH */
     case 6: k1 ^= ((uint64_t)tail[5]) << 40;
+            /* FALLTHROUGH */
     case 5: k1 ^= ((uint64_t)tail[4]) << 32;
+            /* FALLTHROUGH */
     case 4: k1 ^= ((uint64_t)tail[3]) << 24;
+            /* FALLTHROUGH */
     case 3: k1 ^= ((uint64_t)tail[2]) << 16;
+            /* FALLTHROUGH */
     case 2: k1 ^= ((uint64_t)tail[1]) << 8;
+            /* FALLTHROUGH */
     case 1: k1 ^= ((uint64_t)tail[0]) << 0;
             k1 *= c1; k1 = ROTL64(k1, 31); k1 *= c2; h1 ^= k1;
     };
@@ -253,7 +259,10 @@ static void worker_for(void *data, long i, int tid) // callback for kt_for()
 	stepdat_t *s = (stepdat_t*)data;
 	buf_c4_t *b = &s->buf[i];
 	kc_c4_t *h = s->p->h->h[i];
-	int j, p = s->p->h->p;
+	int j;
+	// Unused parameter
+	(void)tid;
+	
 	for (j = 0; j < b->n; ++j) {
 		khint_t k;
 		int absent;
@@ -492,7 +501,7 @@ int main(int argc, char *argv[])
 {
 	kc_c4x_t *h;
 	int i, c, k = 31, p = KC_BITS, block_size = 10000000, n_thread = 4;
-	int N = 0, coverage_threshold = 1;
+	int N = 10000, coverage_threshold = 1;
 	int use_wang_hash = 0;
 	ketopt_t o = KETOPT_INIT;
 	while ((c = ketopt(&o, argc, argv, 1, "k:p:b:t:N:c:wo:", 0)) >= 0) {
@@ -506,7 +515,7 @@ int main(int argc, char *argv[])
 		else if (c == 'o') output_filename = strdup(o.arg);
 	}
 	if (argc - o.ind < 1) {
-		fprintf(stderr, "Usage: kc-c4 [options] <in.fa>\n");
+		fprintf(stderr, "Usage: fgr2 [options] <in.fa>\n");
 		fprintf(stderr, "Options:\n");
 		fprintf(stderr, "  -k INT     k-mer size [%d]\n", k);
 		fprintf(stderr, "  -p INT     prefix length [%d]\n", p);

@@ -28,7 +28,7 @@ def parse_fgr_file(filepath):
                 if len(parts) >= 2:
                     kmer = parts[0]
                     try:
-                        coverage = int(parts[1])
+                        coverage = int(parts[2])
                         kmers.add(kmer)
                         coverages[kmer] = coverage
                     except ValueError:

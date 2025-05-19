@@ -413,7 +413,7 @@ int main(int argc, char *argv[]) {
         for (size_t i = 0; i < HASH_TABLE_SIZE; i++) {
             KmerNode *node = hash_table[i];
             while (node) {
-                if (node->count > coverage_cutoff) {
+                if (node->count > (uint32_t)coverage_cutoff) {
                     uint64_t hash = hash_function(node->kmer);
                     if (top_count < N) {
                         top_kmers[top_count].kmer = node->kmer;
@@ -451,7 +451,7 @@ int main(int argc, char *argv[]) {
             }
             kmer_seq[k] = '\0';
             uint64_t hash = hash_function(top_kmers[i].kmer);
-            fprintf(F_out, "%s\t%u\t%llu\n", kmer_seq, top_kmers[i].count, (unsigned long long)hash);
+            fprintf(F_out, "%s\t%llu\t%u\n", kmer_seq, (unsigned long long)hash, top_kmers[i].count);
         }
         fclose(F_out);
         printf("Top %d k-mers with smallest hash values written to %s using %s hash function\n", 
