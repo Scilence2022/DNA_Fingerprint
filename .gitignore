@@ -58,4 +58,6 @@ fgr2
 *.1
 input_files/
 fq_files
-
+*.cos
+*.jac
+*.png
