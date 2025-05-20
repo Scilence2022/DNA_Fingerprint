@@ -405,7 +405,7 @@ static int find_first_increasing_coverage(uint64_t *counts, int hist_size)
     return 0; // No increasing point found
 }
 
-static void print_hist(const kc_c4x_t *h, int n_thread, const char *output_filename, uint64_t *pre_computed_cnt, int hist_size, int coverage_threshold, int auto_detected)
+static void print_hist(const char *output_filename, uint64_t *pre_computed_cnt, int hist_size, int coverage_threshold, int auto_detected)
 {
 	FILE *hist_file = NULL;
 
@@ -604,7 +604,7 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "  -b INT     block size [%d]\n", block_size);
 		fprintf(stderr, "  -t INT     number of worker threads [%d]\n", n_thread);
 		fprintf(stderr, "  -N INT     number of k-mers to output [%d]\n", N);
-		fprintf(stderr, "  -c INT     minimum coverage threshold [auto-detect]\n");
+		fprintf(stderr, "  -c INT     minimum coverage threshold [default: auto-detect]\n");
 		fprintf(stderr, "             (If not specified, the threshold is automatically detected from the histogram)\n");
 		fprintf(stderr, "  -w         use Thomas Wang's hash function (default: MurmurHash3)\n");
 		fprintf(stderr, "  -o FILE    Output file to write the top N k-mers with minimal hash values and coverage >= c\n");
@@ -683,7 +683,7 @@ int main(int argc, char *argv[])
 	}
 	
 	// Write histogram data to file or stdout
-	print_hist(h, n_thread, output_filename, cnt, hist_size, coverage_threshold, auto_coverage_threshold);
+	print_hist(output_filename, cnt, hist_size, coverage_threshold, auto_coverage_threshold);
 	
 	// Free histogram memory
 	free(cnt);
