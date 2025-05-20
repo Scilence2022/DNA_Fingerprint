@@ -597,7 +597,7 @@ int main(int argc, char *argv[])
 		else if (c == 'o') output_filename = strdup(o.arg);
 	}
 	if (argc - o.ind < 1) {
-		fprintf(stderr, "Usage: fgr2 [options] <in.fa>\n");
+		fprintf(stderr, "Usage: fgr2 [options] <in.fa|in.fq|in.fa.gz|in.fq.gz>\n");
 		fprintf(stderr, "Options:\n");
 		fprintf(stderr, "  -k INT     k-mer size [%d]\n", k);
 		fprintf(stderr, "  -p INT     prefix length [%d]\n", p);
@@ -608,7 +608,11 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "             (If not specified, the threshold is automatically detected from the histogram)\n");
 		fprintf(stderr, "  -w         use Thomas Wang's hash function (default: MurmurHash3)\n");
 		fprintf(stderr, "  -o FILE    Output file to write the top N k-mers with minimal hash values and coverage >= c\n");
-		fprintf(stderr, "             Also creates FILE.hist with k-mer histogram data\n");
+		fprintf(stderr, "             Also creates FILE.hist with k-mer histogram data\n\n");
+		fprintf(stderr, "Supported input formats:\n");
+		fprintf(stderr, "  - FASTA format (*.fa, *.fa.gz)\n");
+		fprintf(stderr, "  - FASTQ format (*.fq, *.fq.gz)\n\n");
+		fprintf(stderr, "Author: Lifu Song <songlf@tib.cas.cn>\n");
 		return 1;
 	}
 	if (p < KC_BITS) {
