@@ -361,53 +361,99 @@ static void worker_hist(void *data, long i, int tid) // callback for kt_for()
 		}
 }
 
-static void print_hist(const kc_c4x_t *h, int n_thread)
+/**
+ * Find the first coverage value where the k-mer count increases.
+ * This can indicate a potential threshold for meaningful coverage.
+ * 
+ * @param counts Array of count values indexed by coverage
+ * @param hist_size Size of the counts array
+ * @return The first coverage value where count increases, or 0 if not found
+ */
+static int find_first_increasing_coverage(uint64_t *counts, int hist_size)
 {
-	hist_aux_t a;
-	uint64_t *cnt = NULL;
-	int i, j;
-	const int hist_size = 1 << KC_BITS;
+    // Skip very low coverage values that might be noisy
+    int start_index = 1;
+    
+    // Find the first valid point to start from
+    while (start_index < hist_size && counts[start_index] == 0) {
+        start_index++;
+    }
+    
+    // We want to find the first time the count increases after it has been decreasing
+    uint64_t prev_count = counts[start_index];
+    int decreasing_streak = 0;
+    
+    for (int i = start_index + 1; i < hist_size; i++) {
+        // Skip zero counts
+        if (counts[i] == 0) continue;
+        
+        // Check if we're still decreasing
+        if (counts[i] < prev_count) {
+            decreasing_streak++;
+            prev_count = counts[i];
+            continue;
+        }
+        
+        // We found an increase after at least one decrease
+        if (decreasing_streak > 0 && counts[i] > prev_count) {
+            return i; // Return the coverage value where the increase occurs
+        }
+        
+        prev_count = counts[i];
+    }
+    
+    return 0; // No increasing point found
+}
 
-	CALLOC(cnt, hist_size);
-	if (!cnt) { 
-		perror("Failed to allocate memory for histogram"); 
-		return; 
-	}
+static void print_hist(const kc_c4x_t *h, int n_thread, const char *output_filename, uint64_t *pre_computed_cnt, int hist_size, int coverage_threshold, int auto_detected)
+{
+	FILE *hist_file = NULL;
 
-	a.h = h;
-	CALLOC(a.cnt, n_thread);
-	if (!a.cnt) {
-		perror("Failed to allocate memory for thread histograms");
-		free(cnt);
-		return;
-	}
-
-	for (j = 0; j < n_thread; ++j) {
-		CALLOC(a.cnt[j].c, hist_size);
-		if (!a.cnt[j].c) {
-			perror("Failed to allocate memory for a thread's histogram buffer");
-			for (int k_idx = 0; k_idx < j; ++k_idx) free(a.cnt[k_idx].c);
-			free(a.cnt);
-			free(cnt);
+	// Open output file if filename is provided
+	if (output_filename) {
+		char *hist_filename = NULL;
+		hist_filename = malloc(strlen(output_filename) + 6); // +6 for ".hist\0"
+		if (!hist_filename) {
+			perror("Failed to allocate memory for histogram filename");
 			return;
 		}
+		sprintf(hist_filename, "%s.hist", output_filename);
+		hist_file = fopen(hist_filename, "w");
+		if (!hist_file) {
+			perror("Failed to open histogram output file");
+			free(hist_filename);
+			return;
+		}
+		printf("Writing histogram data to %s\n", hist_filename);
+		free(hist_filename);
 	}
 
-	kt_for(n_thread, worker_hist, &a, 1<<h->p);
-
-	for (j = 0; j < n_thread; ++j) {
-		for (i = 0; i < hist_size; ++i)
-			cnt[i] += a.cnt[j].c[i];
-		free(a.cnt[j].c);
+	// Write header comments if output file is used
+	if (hist_file) {
+		fprintf(hist_file, "# K-mer coverage histogram\n");
+		if (auto_detected) {
+			fprintf(hist_file, "# Auto-detected coverage threshold: %d\n", coverage_threshold);
+		} else {
+			fprintf(hist_file, "# User-specified coverage threshold: %d\n", coverage_threshold);
+		}
+		fprintf(hist_file, "# Format: <coverage>\t<number_of_kmers>\n");
 	}
-	free(a.cnt);
 
-	for (i = 1; i < hist_size; ++i) {
-		if (cnt[i] > 0) {
-			printf("%d\t%ld\n", i, (long)cnt[i]);
+	// Write counts to file or stdout
+	for (int i = 1; i < hist_size; ++i) {
+		if (pre_computed_cnt[i] > 0) { // Only print non-zero counts
+			if (hist_file) {
+				fprintf(hist_file, "%d\t%ld\n", i, (long)pre_computed_cnt[i]);
+			} else {
+				printf("%d\t%ld\n", i, (long)pre_computed_cnt[i]);
+			}
 		}
 	}
-	free(cnt);
+	
+	// Close output file if opened
+	if (hist_file) {
+		fclose(hist_file);
+	}
 }
 
 // Function to convert k-mer integer to sequence
@@ -533,8 +579,9 @@ int main(int argc, char *argv[])
 {
 	kc_c4x_t *h;
 	int i, c, k = 31, p = KC_BITS, block_size = 10000000, n_thread = 4;
-	int N = 10000, coverage_threshold = 1;
+	int N = 10000, coverage_threshold = 0; // Change default to 0 to indicate auto-detection
 	int use_wang_hash = 0;
+	int auto_coverage_threshold = 1; // Flag to indicate auto-detection should be used
 	ketopt_t o = KETOPT_INIT;
 	while ((c = ketopt(&o, argc, argv, 1, "k:p:b:t:N:c:wo:", 0)) >= 0) {
 		if (c == 'k') k = atoi(o.arg);
@@ -542,7 +589,10 @@ int main(int argc, char *argv[])
 		else if (c == 'b') block_size = atoi(o.arg);
 		else if (c == 't') n_thread = atoi(o.arg);
 		else if (c == 'N') N = atoi(o.arg);
-		else if (c == 'c') coverage_threshold = atoi(o.arg);
+		else if (c == 'c') {
+			coverage_threshold = atoi(o.arg);
+			auto_coverage_threshold = 0; // User specified a threshold, don't auto-detect
+		}
 		else if (c == 'w') use_wang_hash = 1;
 		else if (c == 'o') output_filename = strdup(o.arg);
 	}
@@ -554,9 +604,11 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "  -b INT     block size [%d]\n", block_size);
 		fprintf(stderr, "  -t INT     number of worker threads [%d]\n", n_thread);
 		fprintf(stderr, "  -N INT     number of k-mers to output [%d]\n", N);
-		fprintf(stderr, "  -c INT     minimum coverage threshold [%d]\n", coverage_threshold);
+		fprintf(stderr, "  -c INT     minimum coverage threshold [auto-detect]\n");
+		fprintf(stderr, "             (If not specified, the threshold is automatically detected from the histogram)\n");
 		fprintf(stderr, "  -w         use Thomas Wang's hash function (default: MurmurHash3)\n");
-		fprintf(stderr, "  -o FILE    Output fingerprint of DNA data to FILE\n");
+		fprintf(stderr, "  -o FILE    Output file to write the top N k-mers with minimal hash values and coverage >= c\n");
+		fprintf(stderr, "             Also creates FILE.hist with k-mer histogram data\n");
 		return 1;
 	}
 	if (p < KC_BITS) {
@@ -573,7 +625,68 @@ int main(int argc, char *argv[])
 	}
 
 	h = count_file(argv[o.ind], k, p, block_size, n_thread);
-	print_hist(h, n_thread);
+	
+	// Set up structures for histogram to detect coverage threshold if needed
+	hist_aux_t a;
+	uint64_t *cnt = NULL;
+    int j;
+    const int hist_size = 1 << KC_BITS;
+
+    // Allocate histogram memory
+    CALLOC(cnt, hist_size);
+    if (!cnt) { 
+        perror("Failed to allocate memory for histogram"); 
+        return 1;
+    }
+
+	a.h = h;
+	CALLOC(a.cnt, n_thread);
+    if (!a.cnt) {
+        perror("Failed to allocate memory for thread histograms");
+        free(cnt);
+        return 1;
+    }
+
+    for (j = 0; j < n_thread; ++j) {
+        CALLOC(a.cnt[j].c, hist_size);
+        if (!a.cnt[j].c) {
+            perror("Failed to allocate memory for a thread's histogram buffer");
+            for (int k_idx = 0; k_idx < j; ++k_idx) free(a.cnt[k_idx].c);
+            free(a.cnt);
+            free(cnt);
+            return 1;
+        }
+    }
+
+	// Calculate histogram
+	kt_for(n_thread, worker_hist, &a, 1<<h->p);
+
+	for (j = 0; j < n_thread; ++j) {
+		for (i = 0; i < hist_size; ++i)
+            cnt[i] += a.cnt[j].c[i];
+        free(a.cnt[j].c);
+    }
+	free(a.cnt);
+	
+	// Auto-detect coverage threshold if needed
+	if (auto_coverage_threshold) {
+		int detected_threshold = find_first_increasing_coverage(cnt, hist_size);
+		if (detected_threshold > 0) {
+			coverage_threshold = detected_threshold;
+			printf("Auto-detected coverage threshold: %d\n", coverage_threshold);
+		} else {
+			coverage_threshold = 1; // Default if auto-detection fails
+			printf("No coverage threshold detected automatically. Using default: %d\n", coverage_threshold);
+		}
+	} else {
+		printf("Using user-specified coverage threshold: %d\n", coverage_threshold);
+	}
+	
+	// Write histogram data to file or stdout
+	print_hist(h, n_thread, output_filename, cnt, hist_size, coverage_threshold, auto_coverage_threshold);
+	
+	// Free histogram memory
+	free(cnt);
 
 	FILE *output_fp = stdout; // Default to standard output
 
