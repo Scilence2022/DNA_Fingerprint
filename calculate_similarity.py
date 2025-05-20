@@ -226,6 +226,16 @@ def plot_and_save_dendrogram(distance_matrix, labels, tree_type, output_path_pre
         print(f"Distance matrix shape: {distance_matrix.shape if hasattr(distance_matrix, 'shape') else 'N/A'}, size: {distance_matrix.size if hasattr(distance_matrix, 'size') else 'N/A'}")
         print(f"Labels: {labels}")
 
+def strip_extensions(filename):
+    """
+    Removes .fgr2 and .fgr extensions from filenames for cleaner labels.
+    """
+    if filename.endswith('.fgr2'):
+        return filename[:-5]
+    elif filename.endswith('.fgr'):
+        return filename[:-4]
+    return filename
+
 def main():
     parser = argparse.ArgumentParser(description="Calculate Jaccard Index and Cosine Similarity between .fgr files, and optionally plot relationship trees and build Neighbor-Joining trees.")
     parser.add_argument("directory", nargs='?', default=".", help="Directory containing .fgr files (default: current directory)")
@@ -257,7 +267,9 @@ def main():
     file_basenames = []
     for f_path in fgr_files_paths:
         basename = os.path.basename(f_path)
-        print(f"  - {basename}")
+        # Store the original basename, but print the cleaned version
+        clean_basename = strip_extensions(basename)
+        print(f"  - {clean_basename}")
         file_basenames.append(basename)
     
     file_data = {}
@@ -272,7 +284,12 @@ def main():
         print("Not enough valid .fgr files to compare after parsing (need at least 2).")
         return
 
+    # Initialize matrices and name mapping
     file_basenames = [os.path.basename(p) for p in valid_file_paths]
+    
+    # Create clean basenames for display/output without .fgr2/.fgr extensions
+    clean_basenames = [strip_extensions(b) for b in file_basenames]
+    
     name_to_idx = {name: i for i, name in enumerate(file_basenames)}
     num_files = len(file_basenames)
 
@@ -296,6 +313,10 @@ def main():
         
         basename1 = os.path.basename(file1_path)
         basename2 = os.path.basename(file2_path)
+        
+        # For displaying results, use clean names without extensions
+        clean_basename1 = strip_extensions(basename1)
+        clean_basename2 = strip_extensions(basename2)
 
         idx1 = name_to_idx[basename1]
         idx2 = name_to_idx[basename2]
@@ -309,7 +330,7 @@ def main():
         cosine_matrix[idx2, idx1] = cs
 
         if not args.output_prefix and not args.plot_trees:
-            print(f"\nComparing '{basename1}' and '{basename2}':")
+            print(f"\nComparing '{clean_basename1}' and '{clean_basename2}':")
             print(f"  Jaccard Index: {ji:.4f}")
             print(f"  Cosine Similarity (based on coverage): {cs:.4f}")
 
@@ -320,10 +341,10 @@ def main():
         # Debug the matrices before writing
         print(f"Jaccard matrix shape: {jaccard_matrix.shape}, values range: {np.min(jaccard_matrix):.4f} to {np.max(jaccard_matrix):.4f}")
         print(f"Cosine matrix shape: {cosine_matrix.shape}, values range: {np.min(cosine_matrix):.4f} to {np.max(cosine_matrix):.4f}")
-        print(f"Number of file basenames: {len(file_basenames)}")
+        print(f"Number of file basenames: {len(clean_basenames)}")
         
-        write_matrix_to_file(jaccard_matrix, file_basenames, jac_output_path)
-        write_matrix_to_file(cosine_matrix, file_basenames, cos_output_path)
+        write_matrix_to_file(jaccard_matrix, clean_basenames, jac_output_path)
+        write_matrix_to_file(cosine_matrix, clean_basenames, cos_output_path)
 
     if args.plot_trees and PLOTTING_AVAILABLE:
         print("\n--- Generating Relationship Trees (Dendrograms) ---")
@@ -337,8 +358,8 @@ def main():
 
         # Plot Jaccard Dendrogram
         if num_files >=2:
-            plot_and_save_dendrogram(jaccard_distance_matrix_for_dendro, file_basenames, "Jaccard", args.output_prefix)
-            plot_and_save_dendrogram(cosine_distance_matrix_for_dendro, file_basenames, "Cosine", args.output_prefix)
+            plot_and_save_dendrogram(jaccard_distance_matrix_for_dendro, clean_basenames, "Jaccard", args.output_prefix)
+            plot_and_save_dendrogram(cosine_distance_matrix_for_dendro, clean_basenames, "Cosine", args.output_prefix)
         else:
             print("Skipping dendrogram generation as there are less than 2 files to compare.")
 
@@ -379,7 +400,7 @@ def main():
             # --- Process Jaccard Distances for NJ Tree ---
             print("\nProcessing Jaccard distances for NJ tree...")
             try:
-                skbio_jaccard_dm_orig = DistanceMatrix(nj_jaccard_dist_matrix_np, ids=file_basenames)
+                skbio_jaccard_dm_orig = DistanceMatrix(nj_jaccard_dist_matrix_np, ids=clean_basenames)
                 
                 if current_bootstrap_replicates > 0:
                     print(f"Running {current_bootstrap_replicates} bootstrap replicates for Jaccard NJ tree...")
@@ -410,7 +431,7 @@ def main():
                                 boot_j_distances[r_idx, c_idx] = dist_boot
                                 boot_j_distances[c_idx, r_idx] = dist_boot
                         
-                        skbio_boot_j_dm = DistanceMatrix(boot_j_distances, ids=file_basenames)
+                        skbio_boot_j_dm = DistanceMatrix(boot_j_distances, ids=clean_basenames)
                         
                         try:
                             if skbio_boot_j_dm.shape[0] >= 2:
@@ -435,9 +456,9 @@ def main():
                             except Exception as e:
                                 print(f"Error using majority_consensus: {e}")
                                 print("Falling back to simple consensus method...")
-                                final_tree_j = simple_consensus_tree_with_supports(jaccard_bootstrap_trees, file_basenames)
+                                final_tree_j = simple_consensus_tree_with_supports(jaccard_bootstrap_trees, clean_basenames)
                         else:
-                            final_tree_j = simple_consensus_tree_with_supports(jaccard_bootstrap_trees, file_basenames)
+                            final_tree_j = simple_consensus_tree_with_supports(jaccard_bootstrap_trees, clean_basenames)
                         print("Jaccard NJ consensus tree with bootstrap supports generated.")
                     else:
                         print("No Jaccard bootstrap trees were successfully generated. Building NJ tree on original data without supports.")
@@ -460,7 +481,7 @@ def main():
             # --- Process Cosine Distances for NJ Tree ---
             print("\nProcessing Cosine distances for NJ tree...")
             try:
-                skbio_cosine_dm_orig = DistanceMatrix(nj_cosine_dist_matrix_np, ids=file_basenames)
+                skbio_cosine_dm_orig = DistanceMatrix(nj_cosine_dist_matrix_np, ids=clean_basenames)
 
                 if current_bootstrap_replicates > 0:
                     print(f"Running {current_bootstrap_replicates} bootstrap replicates for Cosine NJ tree...")
@@ -489,7 +510,7 @@ def main():
                                 boot_c_distances[r_idx, c_idx] = dist_boot
                                 boot_c_distances[c_idx, r_idx] = dist_boot
                         
-                        skbio_boot_c_dm = DistanceMatrix(boot_c_distances, ids=file_basenames)
+                        skbio_boot_c_dm = DistanceMatrix(boot_c_distances, ids=clean_basenames)
                         try:
                             if skbio_boot_c_dm.shape[0] >= 2:
                                 if np.all(np.isclose(skbio_boot_c_dm.data, 0)) and skbio_boot_c_dm.shape[0] > 1:
@@ -511,9 +532,9 @@ def main():
                             except Exception as e:
                                 print(f"Error using majority_consensus: {e}")
                                 print("Falling back to simple consensus method...")
-                                final_tree_c = simple_consensus_tree_with_supports(cosine_bootstrap_trees, file_basenames)
+                                final_tree_c = simple_consensus_tree_with_supports(cosine_bootstrap_trees, clean_basenames)
                         else:
-                            final_tree_c = simple_consensus_tree_with_supports(cosine_bootstrap_trees, file_basenames)
+                            final_tree_c = simple_consensus_tree_with_supports(cosine_bootstrap_trees, clean_basenames)
                         print("Cosine NJ consensus tree with bootstrap supports generated.")
                     else:
                         print("No Cosine bootstrap trees were successfully generated. Building NJ tree on original data without supports.")
