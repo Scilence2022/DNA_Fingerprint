@@ -556,7 +556,7 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "  -N INT     number of k-mers to output [%d]\n", N);
 		fprintf(stderr, "  -c INT     minimum coverage threshold [%d]\n", coverage_threshold);
 		fprintf(stderr, "  -w         use Thomas Wang's hash function (default: MurmurHash3)\n");
-		fprintf(stderr, "  -o FILE    Output file to write the top N k-mers with minimal hash values and coverage >= c\n");
+		fprintf(stderr, "  -o FILE    Output fingerprint of DNA data to FILE\n");
 		return 1;
 	}
 	if (p < KC_BITS) {
