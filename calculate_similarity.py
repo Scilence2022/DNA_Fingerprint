@@ -1,5 +1,7 @@
 import os
 import glob
+import math
+import random
 import argparse
 from itertools import combinations
 import numpy as np
@@ -8,6 +10,11 @@ import numpy as np
 PLOTTING_AVAILABLE = False
 try:
     import scipy.cluster.hierarchy as sch
+    # Import squareform from its canonical location. Reaching it via
+    # scipy.cluster.hierarchy.distance relied on an implicit re-export that newer
+    # SciPy releases (>=1.15) no longer provide, which raised AttributeError and
+    # aborted the whole run before any tree was written.
+    from scipy.spatial.distance import squareform
     import matplotlib
     matplotlib.use('Agg')  # Use Agg backend for non-interactive plotting
     import matplotlib.pyplot as plt
@@ -22,7 +29,6 @@ try:
     import skbio
     from skbio import DistanceMatrix
     from skbio.tree import nj, TreeNode # TreeNode for type hinting if needed
-    import random # for bootstrapping
     SKBIO_AVAILABLE = True
     
     # Check if majority_consensus is available
@@ -37,31 +43,57 @@ except ImportError:
 
 def parse_fgr_file(filepath):
     """
-    Parses an .fgr file and returns a set of k-mers and a dictionary of k-mer:coverage.
+    Parses an .fgr/.fgr2 file.
+
+    The expected record format is three tab-separated columns:
+        <kmer>\t<hash>\t<coverage>
+    Lines beginning with '#' are comments. fgr2 emits a self-describing header
+    (``#fgr2\tversion=..\tk=..\tN=..\thash=..\tcoverage_threshold=..``) which is
+    parsed into the returned metadata dict so callers can verify that sketches
+    were generated with compatible parameters.
+
+    Returns
+    -------
+    (kmers, coverages, meta) on success, or (None, None, None) on failure.
     """
     kmers = set()
     coverages = {}
+    meta = {}
     try:
         with open(filepath, 'r') as f:
-            for line in f:
-                parts = line.strip().split('\t')
-                if len(parts) >= 2:
-                    kmer = parts[0]
-                    try:
-                        coverage = int(parts[2])
-                        kmers.add(kmer)
-                        coverages[kmer] = coverage
-                    except ValueError:
-                        print(f"Warning: Could not parse coverage for k-mer '{kmer}' in file {filepath}. Skipping line.")
-                else:
-                    print(f"Warning: Skipping malformed line in {filepath}: {line.strip()}")
+            for lineno, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith('#'):
+                    # fgr2 metadata header, e.g. "#fgr2\tk=31\tN=10000\thash=murmurhash3"
+                    if line.startswith('#fgr2'):
+                        for token in line.split('\t')[1:]:
+                            if '=' in token:
+                                key, _, value = token.partition('=')
+                                meta[key.strip()] = value.strip()
+                    continue
+                parts = line.split('\t')
+                # Coverage lives in the 3rd column; a shorter line is malformed.
+                if len(parts) < 3:
+                    print(f"Warning: Skipping malformed line {lineno} in {filepath}: {line}")
+                    continue
+                kmer = parts[0]
+                try:
+                    coverage = int(parts[2])
+                except ValueError:
+                    print(f"Warning: Could not parse coverage for k-mer '{kmer}' at line "
+                          f"{lineno} in {filepath}. Skipping line.")
+                    continue
+                kmers.add(kmer)
+                coverages[kmer] = coverage
     except FileNotFoundError:
         print(f"Error: File not found {filepath}")
-        return None, None
-    except Exception as e:
+        return None, None, None
+    except OSError as e:
         print(f"Error reading file {filepath}: {e}")
-        return None, None
-    return kmers, coverages
+        return None, None, None
+    return kmers, coverages, meta
 
 def jaccard_index(set1, set2):
     """
@@ -73,114 +105,106 @@ def jaccard_index(set1, set2):
     union = len(set1.union(set2))
     return intersection / union if union != 0 else 0.0
 
-def cosine_similarity_manual(dict1, dict2, standardize=False):
+
+def resample_kmer_universe(all_unique_kmers_list):
+    """
+    Draw a bootstrap k-mer universe by sampling with replacement.
+
+    METHODOLOGICAL NOTE: k-mers are drawn with replacement and then collapsed into a
+    set, which discards multiplicities. Sampling n items with replacement from n and
+    keeping the distinct ones retains ~1 - 1/e ~= 63.2% of the universe, so each
+    replicate is effectively a random ~63% *subsample* of the k-mers rather than a
+    multinomial (Felsenstein) bootstrap. Support values should be read as
+    subsampling/jackknife-style support, not textbook bootstrap proportions. For the
+    presence/absence Jaccard distance multiplicities are irrelevant anyway (the
+    statistic is a function of the sets), but for the coverage-weighted cosine
+    distance a true bootstrap would weight each k-mer by its draw count. This
+    function preserves the original behaviour; changing it would alter published
+    support values and is left as a deliberate decision for the maintainer.
+    """
+    return set(random.choices(all_unique_kmers_list, k=len(all_unique_kmers_list)))
+
+def vector_norm(coverages):
+    """L2 norm of a k-mer coverage dictionary, viewed as a sparse vector."""
+    if not coverages:
+        return 0.0
+    return math.sqrt(sum(float(v) * float(v) for v in coverages.values()))
+
+
+def cosine_similarity_manual(dict1, dict2, standardize=False, norm1=None, norm2=None):
     """
     Calculates the Cosine Similarity between two k-mer coverage dictionaries.
-    
+
+    Vectors are indexed by the union of both k-mer sets, with k-mers absent from a
+    sample contributing 0. Because those absent entries contribute nothing to the
+    dot product, and each vector's norm depends only on its own dictionary, the
+    similarity is computed over just the *intersection* -- mathematically identical
+    to materialising the full union vectors, but O(|A n B|) instead of O(|A u B|)
+    and without allocating two lists per pair.
+
     Parameters
     ----------
     dict1, dict2 : dict
-        Dictionaries mapping k-mers to their coverage values
+        Dictionaries mapping k-mers to their coverage values.
     standardize : bool, optional
-        If True, standardize each dictionary so that the sum of all coverages
-        is equal to 100 * (size of dict). Default is False.
-    
+        Accepted for backwards compatibility. NOTE: this is a mathematical no-op.
+        It rescales each vector by a positive constant, and cosine similarity is
+        invariant under positive scaling: cos(a*u, b*v) == cos(u, v) for a, b > 0.
+        Retained so existing command lines keep working.
+    norm1, norm2 : float, optional
+        Precomputed L2 norms of dict1/dict2. Supplied by callers that compare one
+        sample against many, so each norm is computed once rather than per pair.
+
     Returns
     -------
     float
-        Cosine similarity value between the two dictionaries
+        Cosine similarity value between the two dictionaries.
     """
     if not dict1 and not dict2:
         return 1.0
 
-    # Standardize dictionaries if requested
-    if standardize:
-        # Create copies to avoid modifying the original dictionaries
-        dict1_std = {}
-        dict2_std = {}
-        
-        # Calculate sums of each dictionary
-        sum1 = sum(dict1.values())
-        sum2 = sum(dict2.values())
-        
-        # Calculate target sums (100 * size of dict)
-        target_sum1 = 100 * len(dict1)
-        target_sum2 = 100 * len(dict2)
-        
-        # Calculate scaling factors
-        scale1 = target_sum1 / sum1 if sum1 > 0 else 0
-        scale2 = target_sum2 / sum2 if sum2 > 0 else 0
-        
-        # Create standardized dictionaries
-        for k, v in dict1.items():
-            dict1_std[k] = v * scale1
-        
-        for k, v in dict2.items():
-            dict2_std[k] = v * scale2
-        
-        # Use standardized dictionaries for similarity calculation
-        dict1, dict2 = dict1_std, dict2_std
+    if norm1 is None:
+        norm1 = vector_norm(dict1)
+    if norm2 is None:
+        norm2 = vector_norm(dict2)
 
-    all_kmers = set(dict1.keys()).union(set(dict2.keys()))
-    if not all_kmers:
-        return 1.0
-
-    vec1 = []
-    vec2 = []
-    for kmer in all_kmers:
-        vec1.append(dict1.get(kmer, 0))
-        vec2.append(dict2.get(kmer, 0))
-
-    vec1_np = np.array(vec1)
-    vec2_np = np.array(vec2)
-
-    dot_product = np.dot(vec1_np, vec2_np)
-    norm_vec1 = np.linalg.norm(vec1_np)
-    norm_vec2 = np.linalg.norm(vec2_np)
-
-    if norm_vec1 == 0 or norm_vec2 == 0:
+    if norm1 == 0 or norm2 == 0:
         return 0.0
-    
-    similarity = dot_product / (norm_vec1 * norm_vec2)
-    return similarity
+
+    # Iterate the smaller dictionary; only shared k-mers contribute to the dot product.
+    if len(dict1) > len(dict2):
+        dict1, dict2 = dict2, dict1
+    get = dict2.get
+    dot = 0.0
+    for kmer, value in dict1.items():
+        other = get(kmer)
+        if other is not None:
+            dot += float(value) * float(other)
+
+    return dot / (norm1 * norm2)
 
 def write_matrix_to_file(matrix, filenames, output_filepath):
     """
     Writes a similarity matrix to a tab-separated file.
     """
+    if matrix.shape[0] != len(filenames):
+        print(f"Error: matrix is {matrix.shape} but {len(filenames)} labels were supplied; "
+              f"refusing to write {output_filepath}.")
+        return
+
     try:
-        print(f"Writing matrix with shape {matrix.shape} to {output_filepath}")
-        print(f"Number of filenames: {len(filenames)}")
-        
         with open(output_filepath, 'w') as f:
             # Write header row
-            header = "\t" + "\t".join(filenames)
-            f.write(header + "\n")
-            
+            f.write("\t" + "\t".join(filenames) + "\n")
+
             # Write each data row
-            for i, filename in enumerate(filenames):
-                if i >= matrix.shape[0]:
-                    print(f"Warning: Filename index {i} exceeds matrix dimensions {matrix.shape}")
-                    continue
-                
-                row_values = "\t".join([f"{val:.4f}" for val in matrix[i]])
-                line = f"{filename}\t{row_values}"
-                f.write(line + "\n")
-                
-        # Verify file was written correctly
-        try:
-            with open(output_filepath, 'r') as f:
-                line_count = sum(1 for _ in f)
-            print(f"Verification: {output_filepath} contains {line_count} lines (expected {len(filenames) + 1})")
-            if line_count != len(filenames) + 1:
-                print(f"WARNING: Expected {len(filenames) + 1} lines (header + {len(filenames)} data rows) but found {line_count} lines")
-        except Exception as e:
-            print(f"Error verifying file: {e}")
-            
+            for filename, row in zip(filenames, matrix):
+                row_values = "\t".join(f"{val:.4f}" for val in row)
+                f.write(f"{filename}\t{row_values}\n")
+
         print(f"Successfully wrote matrix to {output_filepath}")
-    except Exception as e:
+    except OSError as e:
         print(f"Error writing matrix to {output_filepath}: {e}")
-        print(f"Matrix shape: {matrix.shape}, Filenames length: {len(filenames)}")
 
 def plot_and_save_dendrogram(distance_matrix, labels, tree_type, output_path_prefix):
     """
@@ -192,20 +216,21 @@ def plot_and_save_dendrogram(distance_matrix, labels, tree_type, output_path_pre
         print("Please install them using: pip install scipy matplotlib")
         return
         
-    if distance_matrix.ndim == 2 and distance_matrix.shape[0] == distance_matrix.shape[1]:
-        # Convert square distance matrix to condensed form if necessary
-        # Ensure it's not already a condensed matrix by checking shape
-        if distance_matrix.shape[0] > 1: # Only condense if it's not a 1x1 matrix (single element)
-             distance_matrix = sch.distance.squareform(distance_matrix, checks=False)
-        elif distance_matrix.shape[0] == 1:
-            print(f"Skipping dendrogram for {tree_type}: Only one item, cannot form a tree.")
-            return 
-
-    if distance_matrix.size == 0 and len(labels) <= 1:
-        print(f"Skipping dendrogram for {tree_type}: Not enough items to form a tree (labels: {len(labels)}).")
-        return
-    
     try:
+        if distance_matrix.ndim == 2 and distance_matrix.shape[0] == distance_matrix.shape[1]:
+            # Convert square distance matrix to condensed form if necessary
+            # Ensure it's not already a condensed matrix by checking shape
+            if distance_matrix.shape[0] > 1: # Only condense if it's not a 1x1 matrix (single element)
+                distance_matrix = squareform(distance_matrix, checks=False)
+            elif distance_matrix.shape[0] == 1:
+                print(f"Skipping dendrogram for {tree_type}: Only one item, cannot form a tree.")
+                return
+
+        if distance_matrix.size == 0 and len(labels) <= 1:
+            print(f"Skipping dendrogram for {tree_type}: Not enough items to form a tree (labels: {len(labels)}).")
+            return
+
+
         linked = sch.linkage(distance_matrix, method='average')
         plt.figure(figsize=(10, max(5, len(labels) * 0.5))) # Adjust figure size based on number of labels
         sch.dendrogram(linked, orientation='right', labels=labels, leaf_font_size=10)
@@ -236,6 +261,73 @@ def strip_extensions(filename):
         return filename[:-4]
     return filename
 
+
+def disambiguate_labels(clean_names, fallback_names):
+    """
+    Ensure labels are unique.
+
+    Stripping extensions can map distinct files onto the same label (e.g. both
+    ``sample.fgr`` and ``sample.fgr2``). Duplicate ids raise an error in
+    skbio.DistanceMatrix and make dendrogram labels ambiguous, so any name that is
+    not unique reverts to the full basename (and, if still ambiguous, gets a suffix).
+    """
+    counts = {}
+    for name in clean_names:
+        counts[name] = counts.get(name, 0) + 1
+
+    result = []
+    used = set()
+    for clean, fallback in zip(clean_names, fallback_names):
+        label = clean if counts[clean] == 1 else fallback
+        if label in used:
+            suffix = 2
+            while f"{label}_{suffix}" in used:
+                suffix += 1
+            label = f"{label}_{suffix}"
+        used.add(label)
+        result.append(label)
+
+    changed = [(c, r) for c, r in zip(clean_names, result) if c != r]
+    if changed:
+        print("Note: some labels collided after extension stripping and were disambiguated:")
+        for original, final in changed:
+            print(f"  '{original}' -> '{final}'")
+    return result
+
+
+def check_sketch_compatibility(file_paths, file_meta):
+    """
+    Warn when sketches were not generated with comparable fgr2 parameters.
+
+    Jaccard and Cosine similarities are only meaningful across sketches built with
+    the same k, the same hash function, and a comparable sketch size / coverage
+    threshold. Mixing them (e.g. k=21 against k=31, or MurmurHash3 against Wang)
+    silently yields near-zero similarity that looks like a biological result.
+    Sketches produced by older fgr2 builds carry no metadata header and are skipped.
+    """
+    annotated = {p: file_meta.get(p) or {} for p in file_paths}
+    described = [p for p in file_paths if annotated[p]]
+    if not described:
+        return
+
+    for field, label in (('k', 'k-mer size'), ('hash', 'hash function')):
+        values = {}
+        for p in described:
+            value = annotated[p].get(field)
+            if value is not None:
+                values.setdefault(value, []).append(os.path.basename(p))
+        if len(values) > 1:
+            print(f"\nWARNING: sketches were built with different {label} ({field}):")
+            for value, names in sorted(values.items()):
+                shown = ', '.join(names[:4]) + (' ...' if len(names) > 4 else '')
+                print(f"  {field}={value}: {shown}")
+            print(f"  Similarities across different {label} values are not meaningful.")
+
+    if len(described) < len(file_paths):
+        missing = len(file_paths) - len(described)
+        print(f"Note: {missing} sketch file(s) carry no fgr2 metadata header "
+              f"(older format); their parameters could not be verified.")
+
 def main():
     parser = argparse.ArgumentParser(description="Calculate Jaccard Index and Cosine Similarity between .fgr files, and optionally plot relationship trees and build Neighbor-Joining trees.")
     parser.add_argument("directory", nargs='?', default=".", help="Directory containing .fgr files (default: current directory)")
@@ -243,8 +335,19 @@ def main():
     parser.add_argument("--no-plot_trees", action='store_false', dest='plot_trees', help="Disable generation of hierarchical clustering relationship trees (dendrograms). Trees are generated by default.")
     parser.add_argument("--no-nj_tree", action='store_false', dest='nj_tree', help="Disable generation of Neighbor-Joining trees. Trees are generated by default.")
     parser.add_argument("--bootstrap_replicates", type=int, default=100, help="Number of bootstrap replicates for Neighbor-Joining trees (default: 100). Only used if NJ trees are enabled.")
-    parser.add_argument("--standardize", action="store_true", help="Standardize k-mer coverage values to 100 × (size of dict) before calculating cosine similarity.")
+    parser.add_argument("--standardize", action="store_true", help="Deprecated no-op: cosine similarity is invariant under the positive rescaling this applied, so results are identical with or without it. Accepted for backwards compatibility.")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for bootstrap resampling, for reproducible support values.")
     args = parser.parse_args()
+
+    if args.bootstrap_replicates < 0:
+        parser.error("--bootstrap_replicates must be >= 0")
+
+    if args.standardize:
+        print("NOTE: --standardize has no effect. Cosine similarity is invariant under the\n"
+              "      positive per-vector rescaling it performs, so output is unchanged.")
+
+    if args.seed is not None:
+        random.seed(args.seed)
 
     # Check if plotting is requested but not available
     if args.plot_trees and not PLOTTING_AVAILABLE:
@@ -273,25 +376,42 @@ def main():
         file_basenames.append(basename)
     
     file_data = {}
+    file_meta = {}
     valid_file_paths = []
     for f_path in fgr_files_paths:
-        kmers, coverages = parse_fgr_file(f_path)
-        if kmers is not None and coverages is not None:
-            file_data[f_path] = (kmers, coverages)
-            valid_file_paths.append(f_path)
+        kmers, coverages, meta = parse_fgr_file(f_path)
+        if kmers is None or coverages is None:
+            continue
+        if not kmers:
+            # An empty sketch would compare as distance 0 to every other empty sketch
+            # and as distance 1 to everything else, silently corrupting the tree.
+            print(f"Warning: {os.path.basename(f_path)} contains no usable k-mers. Excluding it.")
+            continue
+        file_data[f_path] = (kmers, coverages)
+        file_meta[f_path] = meta
+        valid_file_paths.append(f_path)
 
     if len(valid_file_paths) < 2:
         print("Not enough valid .fgr files to compare after parsing (need at least 2).")
         return
 
+    check_sketch_compatibility(valid_file_paths, file_meta)
+
     # Initialize matrices and name mapping
     file_basenames = [os.path.basename(p) for p in valid_file_paths]
-    
-    # Create clean basenames for display/output without .fgr2/.fgr extensions
-    clean_basenames = [strip_extensions(b) for b in file_basenames]
-    
+
+    # Create clean basenames for display/output without .fgr2/.fgr extensions.
+    # Stripping extensions can collide (e.g. sample.fgr and sample.fgr2), which would
+    # produce duplicate tree/matrix labels, so fall back to the full basename.
+    clean_basenames = disambiguate_labels([strip_extensions(b) for b in file_basenames],
+                                          file_basenames)
+
     name_to_idx = {name: i for i, name in enumerate(file_basenames)}
     num_files = len(file_basenames)
+
+    # Norms depend only on a sample's own coverages, so compute each once here rather
+    # than re-deriving them inside every pairwise cosine call.
+    file_norms = {p: vector_norm(file_data[p][1]) for p in valid_file_paths}
 
     jaccard_matrix = np.zeros((num_files, num_files))
     cosine_matrix = np.zeros((num_files, num_files))
@@ -304,25 +424,17 @@ def main():
     elif args.output_prefix:
          print(f"\n--- Processing for Output Prefix: {args.output_prefix} ---")
 
-    for (file1_path, data1), (file2_path, data2) in combinations(file_data.items(), 2):
-        if file1_path not in valid_file_paths or file2_path not in valid_file_paths:
-            continue
+    for file1_path, file2_path in combinations(valid_file_paths, 2):
+        kmers1, coverages1 = file_data[file1_path]
+        kmers2, coverages2 = file_data[file2_path]
 
-        kmers1, coverages1 = data1
-        kmers2, coverages2 = data2
-        
-        basename1 = os.path.basename(file1_path)
-        basename2 = os.path.basename(file2_path)
-        
-        # For displaying results, use clean names without extensions
-        clean_basename1 = strip_extensions(basename1)
-        clean_basename2 = strip_extensions(basename2)
-
-        idx1 = name_to_idx[basename1]
-        idx2 = name_to_idx[basename2]
+        idx1 = name_to_idx[os.path.basename(file1_path)]
+        idx2 = name_to_idx[os.path.basename(file2_path)]
 
         ji = jaccard_index(kmers1, kmers2)
-        cs = cosine_similarity_manual(coverages1, coverages2, args.standardize)
+        cs = cosine_similarity_manual(coverages1, coverages2, args.standardize,
+                                      norm1=file_norms[file1_path],
+                                      norm2=file_norms[file2_path])
 
         jaccard_matrix[idx1, idx2] = ji
         jaccard_matrix[idx2, idx1] = ji
@@ -330,19 +442,15 @@ def main():
         cosine_matrix[idx2, idx1] = cs
 
         if not args.output_prefix and not args.plot_trees:
-            print(f"\nComparing '{clean_basename1}' and '{clean_basename2}':")
+            # Labels are index-aligned with valid_file_paths, so reuse them directly.
+            print(f"\nComparing '{clean_basenames[idx1]}' and '{clean_basenames[idx2]}':")
             print(f"  Jaccard Index: {ji:.4f}")
             print(f"  Cosine Similarity (based on coverage): {cs:.4f}")
 
     if args.output_prefix:
         jac_output_path = args.output_prefix + ".jac"
         cos_output_path = args.output_prefix + ".cos"
-        
-        # Debug the matrices before writing
-        print(f"Jaccard matrix shape: {jaccard_matrix.shape}, values range: {np.min(jaccard_matrix):.4f} to {np.max(jaccard_matrix):.4f}")
-        print(f"Cosine matrix shape: {cosine_matrix.shape}, values range: {np.min(cosine_matrix):.4f} to {np.max(cosine_matrix):.4f}")
-        print(f"Number of file basenames: {len(clean_basenames)}")
-        
+
         write_matrix_to_file(jaccard_matrix, clean_basenames, jac_output_path)
         write_matrix_to_file(cosine_matrix, clean_basenames, cos_output_path)
 
@@ -410,24 +518,22 @@ def main():
                              print(f"  Bootstrap replicate {i+1}/{current_bootstrap_replicates}...")
                         
                         # Create bootstrapped k-mer universe
-                        current_bootstrap_kmer_universe = set(random.choices(all_unique_kmers_list, k=len(all_unique_kmers_list)))
-                        
+                        current_bootstrap_kmer_universe = resample_kmer_universe(all_unique_kmers_list)
+
+                        # Restrict each sample to the resampled universe ONCE per
+                        # replicate. Doing this inside the pair loop below would repeat
+                        # identical work num_files-1 times per sample, making the
+                        # replicate O(n^2 * |kmers|) instead of O(n * |kmers|).
+                        kmers_boot = [file_data[p][0] & current_bootstrap_kmer_universe
+                                      for p in valid_file_paths]
+
                         boot_j_distances = np.zeros((num_files, num_files))
-                        
+
                         for r_idx in range(num_files): # row index
                             for c_idx in range(r_idx + 1, num_files): # column index
-                                path1 = valid_file_paths[r_idx]
-                                path2 = valid_file_paths[c_idx]
-                                
-                                kmers1_orig, _ = file_data[path1]
-                                kmers2_orig, _ = file_data[path2]
-
-                                kmers1_boot = kmers1_orig.intersection(current_bootstrap_kmer_universe)
-                                kmers2_boot = kmers2_orig.intersection(current_bootstrap_kmer_universe)
-                                
-                                ji_boot = jaccard_index(kmers1_boot, kmers2_boot)
+                                ji_boot = jaccard_index(kmers_boot[r_idx], kmers_boot[c_idx])
                                 dist_boot = 1.0 - ji_boot
-                                
+
                                 boot_j_distances[r_idx, c_idx] = dist_boot
                                 boot_j_distances[c_idx, r_idx] = dist_boot
                         
@@ -490,23 +596,24 @@ def main():
                         if (i + 1) % 10 == 0 or i == current_bootstrap_replicates -1:
                             print(f"  Bootstrap replicate {i+1}/{current_bootstrap_replicates}...")
 
-                        current_bootstrap_kmer_universe = set(random.choices(all_unique_kmers_list, k=len(all_unique_kmers_list)))
+                        current_bootstrap_kmer_universe = resample_kmer_universe(all_unique_kmers_list)
+
+                        # Filter each sample's coverages and derive its norm ONCE per
+                        # replicate, rather than rebuilding both dicts for every pair.
+                        cov_boot = [{k: v for k, v in file_data[p][1].items()
+                                     if k in current_bootstrap_kmer_universe}
+                                    for p in valid_file_paths]
+                        norms_boot = [vector_norm(c) for c in cov_boot]
+
                         boot_c_distances = np.zeros((num_files, num_files))
 
                         for r_idx in range(num_files): # row index
                             for c_idx in range(r_idx + 1, num_files): # column index
-                                path1 = valid_file_paths[r_idx]
-                                path2 = valid_file_paths[c_idx]
-
-                                _, cov1_orig = file_data[path1]
-                                _, cov2_orig = file_data[path2]
-
-                                cov1_boot = {k: v for k, v in cov1_orig.items() if k in current_bootstrap_kmer_universe}
-                                cov2_boot = {k: v for k, v in cov2_orig.items() if k in current_bootstrap_kmer_universe}
-
-                                cs_boot = cosine_similarity_manual(cov1_boot, cov2_boot, args.standardize)
+                                cs_boot = cosine_similarity_manual(
+                                    cov_boot[r_idx], cov_boot[c_idx], args.standardize,
+                                    norm1=norms_boot[r_idx], norm2=norms_boot[c_idx])
                                 dist_boot = 1.0 - cs_boot
-                                
+
                                 boot_c_distances[r_idx, c_idx] = dist_boot
                                 boot_c_distances[c_idx, r_idx] = dist_boot
                         

@@ -46,12 +46,16 @@ DNA Sequence Files (FASTA/FASTQ)
 
 **Output Format**:
 ```
-# .fgr2 file format:
+# .fgr2 file format (lines starting with '#' are metadata/comments):
+#fgr2   version=2.1.0  k=31  N=10000  hash=murmurhash3  coverage_threshold=2  n_kmers=10000
+#kmer   hash    coverage
 ATCGATCGATCG    12345678901234567890    15
 GCTAGCTAGCTA    23456789012345678901    22
 ...
-# k-mer_sequence    hash_value    coverage_count
+# k-mer_sequence    hash_value    coverage_count  (sorted by ascending hash)
 ```
+The metadata header lets `calculate_similarity.py` verify that sketches being
+compared were built with the same `k` and hash function.
 
 ### calculate_similarity.py - Similarity Analysis Tool
 **Purpose**: Compare DNA fingerprints and build phylogenetic relationships

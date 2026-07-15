@@ -1,4 +1,17 @@
-numpy
-scipy
-matplotlib
-scikit-bio 
+# Python dependencies for calculate_similarity.py
+#
+# Lower bounds are the oldest releases the code is known to work with; they are
+# specified explicitly because unpinned dependencies previously allowed silent API
+# drift (e.g. scipy >= 1.15 removed the implicit scipy.cluster.hierarchy.distance
+# re-export, which aborted every run).
+#
+# Last verified against: numpy 2.5.1, scipy 1.18.0, matplotlib 3.10, scikit-bio 0.7.3
+# and numpy 1.26.4 / scipy 1.13.1.
+
+numpy>=1.24
+scipy>=1.10
+matplotlib>=3.7
+
+# Optional: only required for Neighbor-Joining tree construction (--nj_tree).
+# Jaccard/Cosine matrices and dendrograms work without it.
+scikit-bio>=0.5.9

@@ -186,8 +186,12 @@ static inline uint64_t hash_murmur3(uint64_t key)
 	return MurmurHash3_x64_64(&key, sizeof(key), 42); // Use 42 as a seed, or choose another value
 }
 
-// Function pointer for the selected hash function
+#define FGR2_VERSION "2.1.0"
+
+// Function pointer for the selected hash function, and its name as written to the
+// output header so sketches record which hash they were built with.
 static uint64_t (*selected_hash_func)(uint64_t) = NULL;
+static const char *selected_hash_name = "murmurhash3";
 
 typedef struct {
 	int p; // suffix length; at least 8
@@ -219,7 +223,11 @@ static inline void c4x_insert_buf(buf_c4_t *buf, int p, uint64_t y) // insert a 
 		b->m = b->m < 8? 8 : b->m + (b->m>>1);
 		REALLOC(b->a, b->m);
 	}
-	b->a[b->n++] = y;
+	// Store only the high bits: the low $p bits are implied by the sub-table index
+	// $pre. select_top_kmers() rebuilds the full hash as (high << p) | pre, so the
+	// suffix must be stripped here for that round-trip to be exact. Keeping the full
+	// value would also overflow the 64-bit table key once shifted left by KC_BITS.
+	b->a[b->n++] = y >> p;
 }
 
 static void count_seq_buf(buf_c4_t *buf, int k, int p, int len, const char *seq) // insert k-mers in $seq to linear buffer $buf
@@ -373,12 +381,17 @@ static int find_first_increasing_coverage(uint64_t *counts, int hist_size)
 {
     // Skip very low coverage values that might be noisy
     int start_index = 1;
-    
+
     // Find the first valid point to start from
     while (start_index < hist_size && counts[start_index] == 0) {
         start_index++;
     }
-    
+
+    // No non-zero bin at all (e.g. every input sequence was shorter than k): there is
+    // no spectrum to analyse. Without this guard counts[start_index] would read one
+    // element past the end of the array.
+    if (start_index >= hist_size) return 0;
+
     // We want to find the first time the count increases after it has been decreasing
     uint64_t prev_count = counts[start_index];
     int decreasing_streak = 0;
@@ -411,20 +424,20 @@ static void print_hist(const char *output_filename, uint64_t *pre_computed_cnt, 
 
 	// Open output file if filename is provided
 	if (output_filename) {
-		char *hist_filename = NULL;
-		hist_filename = malloc(strlen(output_filename) + 6); // +6 for ".hist\0"
+		size_t len = strlen(output_filename) + 6; // +6 for ".hist\0"
+		char *hist_filename = malloc(len);
 		if (!hist_filename) {
 			perror("Failed to allocate memory for histogram filename");
 			return;
 		}
-		sprintf(hist_filename, "%s.hist", output_filename);
+		snprintf(hist_filename, len, "%s.hist", output_filename);
 		hist_file = fopen(hist_filename, "w");
 		if (!hist_file) {
 			perror("Failed to open histogram output file");
 			free(hist_filename);
 			return;
 		}
-		printf("Writing histogram data to %s\n", hist_filename);
+		fprintf(stderr, "Writing histogram data to %s\n", hist_filename);
 		free(hist_filename);
 	}
 
@@ -439,14 +452,12 @@ static void print_hist(const char *output_filename, uint64_t *pre_computed_cnt, 
 		fprintf(hist_file, "# Format: <coverage>\t<number_of_kmers>\n");
 	}
 
-	// Write counts to file or stdout
+	// Write counts to the .hist file, or to stderr when no -o was given. The histogram
+	// must not go to stdout: in stdout mode that stream carries the fingerprint itself.
+	FILE *dst = hist_file ? hist_file : stderr;
 	for (int i = 1; i < hist_size; ++i) {
 		if (pre_computed_cnt[i] > 0) { // Only print non-zero counts
-			if (hist_file) {
-				fprintf(hist_file, "%d\t%ld\n", i, (long)pre_computed_cnt[i]);
-			} else {
-				printf("%d\t%ld\n", i, (long)pre_computed_cnt[i]);
-			}
+			fprintf(dst, "%d\t%ld\n", i, (long)pre_computed_cnt[i]);
 		}
 	}
 	
@@ -456,17 +467,15 @@ static void print_hist(const char *output_filename, uint64_t *pre_computed_cnt, 
 	}
 }
 
-// Function to convert k-mer integer to sequence
-static char *uint64_t_to_seq(uint64_t y, int k)
+// Decode a 2-bit packed k-mer into $seq, which must hold at least k+1 bytes.
+static void uint64_t_to_seq(uint64_t y, int k, char *seq)
 {
-	char *seq = (char*)malloc(k + 1);
 	int i;
 	for (i = k - 1; i >= 0; --i) {
 		seq[i] = "ACGT"[y & 0x3];
 		y >>= 2;
 	}
 	seq[k] = '\0';
-	return seq;
 }
 
 typedef struct {
@@ -483,7 +492,7 @@ static void heapify_down(kmer_t *heap, int heap_size, int i)
 	int right = 2 * i + 2;
 	if (left < heap_size && heap[left].hash > heap[largest].hash)
 		largest = left;
-	if (right < heap_size && heap[left].hash > heap[largest].hash)
+	if (right < heap_size && heap[right].hash > heap[largest].hash)
 		largest = right;
 	if (largest != i) {
 		kmer_t temp = heap[i];
@@ -517,9 +526,14 @@ static void select_top_kmers(const kc_c4x_t *h, int N, int coverage_threshold, i
 {
 	int i;
 	// Max-heap to store k-mers
-	kmer_t *heap = (kmer_t*)malloc(N * sizeof(kmer_t));
+	kmer_t *heap = (kmer_t*)malloc((size_t)N * sizeof(kmer_t));
 	int heap_size = 0;
 	uint64_t mask = (1ULL << (k * 2)) - 1; // Mask to confine to k-mer bit space
+
+	if (!heap) {
+		perror("Failed to allocate memory for the k-mer heap");
+		return;
+	}
 
 	for (i = 0; i < 1 << h->p; ++i) {
 		kc_c4_t *g = h->h[i];
@@ -558,12 +572,15 @@ static void select_top_kmers(const kc_c4x_t *h, int N, int coverage_threshold, i
 	// Sort the heap array based on the hash values
 	qsort(heap, heap_size, sizeof(kmer_t), compare_kmers);
 
-	// Output k-mers from the sorted heap
-	fprintf(output_fp, "#Top %d k-mers with minimal hash values and coverage >= %d:\n", N, coverage_threshold);
+	// Self-describing header: downstream tools (calculate_similarity.py) read these
+	// fields to verify that sketches being compared were built compatibly.
+	fprintf(output_fp, "#fgr2\tversion=%s\tk=%d\tN=%d\thash=%s\tcoverage_threshold=%d\tn_kmers=%d\n",
+			FGR2_VERSION, k, N, selected_hash_name, coverage_threshold, heap_size);
+	fprintf(output_fp, "#kmer\thash\tcoverage\n");
 	for (i = 0; i < heap_size; ++i) {
-		char *seq = uint64_t_to_seq(heap[i].y, k);
+		char seq[32]; // k <= 31 is enforced in main()
+		uint64_t_to_seq(heap[i].y, k, seq);
 		fprintf(output_fp, "%s\t%llu\t%d\n", seq, (unsigned long long)heap[i].hash, heap[i].count);
-		free(seq);
 	}
     
 	// Ensure that the output is flushed to the file
@@ -619,17 +636,52 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "ERROR: -p should be at least %d\n", KC_BITS);
 		return 1;
 	}
+	// 1<<p sub-tables are allocated, and p is used in int shifts: cap it so the
+	// shift stays defined and the allocation stays sane.
+	if (p > 24) {
+		fprintf(stderr, "ERROR: -p should be at most 24 (got %d)\n", p);
+		return 1;
+	}
+	// The 2-bit encoding packs 2*k bits into a uint64_t, so k must not exceed 31;
+	// k >= 32 would make (1ULL << k*2) undefined behaviour.
+	if (k < 1 || k > 31) {
+		fprintf(stderr, "ERROR: -k must be between 1 and 31 (got %d)\n", k);
+		return 1;
+	}
+	if (N < 0) {
+		fprintf(stderr, "ERROR: -N must be >= 0 (got %d)\n", N);
+		return 1;
+	}
+	if (coverage_threshold < 0) {
+		fprintf(stderr, "ERROR: -c must be >= 0 (got %d)\n", coverage_threshold);
+		return 1;
+	}
+	if (n_thread < 1) {
+		fprintf(stderr, "ERROR: -t must be >= 1 (got %d)\n", n_thread);
+		return 1;
+	}
+	if (block_size < 1) {
+		fprintf(stderr, "ERROR: -b must be >= 1 (got %d)\n", block_size);
+		return 1;
+	}
 
 	if (use_wang_hash) {
 		selected_hash_func = hash_wang;
-		printf("Using Thomas Wang's hash function.\n");
+		selected_hash_name = "wang";
+		fprintf(stderr, "Using Thomas Wang's hash function.\n");
 	} else {
 		selected_hash_func = hash_murmur3;
-		printf("Using MurmurHash3 hash function.\n");
+		selected_hash_name = "murmurhash3";
+		fprintf(stderr, "Using MurmurHash3 hash function.\n");
 	}
 
 	h = count_file(argv[o.ind], k, p, block_size, n_thread);
-	
+	if (!h) {
+		fprintf(stderr, "ERROR: cannot open or read input file '%s'\n", argv[o.ind]);
+		free(output_filename);
+		return 1;
+	}
+
 	// Set up structures for histogram to detect coverage threshold if needed
 	hist_aux_t a;
 	uint64_t *cnt = NULL;
@@ -677,13 +729,13 @@ int main(int argc, char *argv[])
 		int detected_threshold = find_first_increasing_coverage(cnt, hist_size);
 		if (detected_threshold > 0) {
 			coverage_threshold = detected_threshold;
-			printf("Auto-detected coverage threshold: %d\n", coverage_threshold);
+			fprintf(stderr, "Auto-detected coverage threshold: %d\n", coverage_threshold);
 		} else {
 			coverage_threshold = 1; // Default if auto-detection fails
-			printf("No coverage threshold detected automatically. Using default: %d\n", coverage_threshold);
+			fprintf(stderr, "No coverage threshold detected automatically. Using default: %d\n", coverage_threshold);
 		}
 	} else {
-		printf("Using user-specified coverage threshold: %d\n", coverage_threshold);
+		fprintf(stderr, "Using user-specified coverage threshold: %d\n", coverage_threshold);
 	}
 	
 	// Write histogram data to file or stdout
