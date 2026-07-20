@@ -143,8 +143,9 @@ char *read_sequences_kseq(const char *filename, size_t *total_length) {
     int l;
 
     while ((l = kseq_read(seq)) >= 0) {
-        if (*total_length + seq->seq.l + 1 > current_capacity) {
-            current_capacity = (*total_length + seq->seq.l + 1) * 1.5; // Allocate 50% more space
+        // +2: one byte for a record separator, one for the final NUL.
+        if (*total_length + seq->seq.l + 2 > current_capacity) {
+            current_capacity = (*total_length + seq->seq.l + 2) * 1.5; // Allocate 50% more space
             if (current_capacity < BUFFER_SIZE) current_capacity = BUFFER_SIZE;
             char *new_sequences = realloc(all_sequences, current_capacity);
             if (new_sequences == NULL) {
@@ -156,6 +157,12 @@ char *read_sequences_kseq(const char *filename, size_t *total_length) {
             }
             all_sequences = new_sequences;
         }
+        // Separate records with a non-ACGT byte. Records were previously concatenated
+        // directly, so any k-mer spanning the join between two reads was counted as a
+        // real k-mer even though it exists in neither. dna_to_int() rejects 'N', so
+        // the separator makes those chimeric windows drop out naturally.
+        if (*total_length > 0)
+            all_sequences[(*total_length)++] = 'N';
         memcpy(all_sequences + *total_length, seq->seq.s, seq->seq.l);
         *total_length += seq->seq.l;
     }
@@ -196,16 +203,14 @@ void *count_kmers(void *arg) {
     KmerNode **hash_table = data->hash_table;
     pthread_mutex_t *mutexes = data->mutexes;
 
-    size_t processed = 0;
-    for (size_t i = start; i <= end - k; i++) {
+    // NOTE: the bound is written as an addition. The original `i <= end - k` computed
+    // `end - k` in unsigned size_t arithmetic, so any range shorter than k (an empty
+    // file, or more threads than bases) wrapped to ~SIZE_MAX and read far past the
+    // end of the buffer.
+    for (size_t i = start; i + (size_t)k <= end; i++) {
         uint64_t kmer = dna_to_int(&seq[i], k);
-        if (kmer == UINT64_MAX) continue; // Skip invalid k-mers
+        if (kmer == UINT64_MAX) continue; // Skip invalid k-mers (non-ACGT, or a record separator)
         insert_kmer(hash_table, mutexes, kmer);
-        processed++;
-        // Optional: progress reporting
-        if (processed % 1000000 == 0) {
-            printf("Thread %p processed %zu k-mers\n", (void*)pthread_self(), processed);
-        }
     }
     return NULL;
 }
@@ -279,10 +284,17 @@ int main(int argc, char *argv[]) {
     }
 
     // Check if required arguments are provided
-    if (optind >= argc || k <= 0 || k > MAX_KMER_SIZE || num_threads <= 0) {
+    if (optind >= argc || k <= 0 || k > MAX_KMER_SIZE || num_threads <= 0 || N <= 0
+        || coverage_cutoff < 0) {
         print_usage(argv[0]);
         return EXIT_FAILURE;
     }
+
+    fprintf(stderr,
+            "NOTE: fgr is deprecated and retained only for backwards compatibility.\n"
+            "      Use fgr2 instead: it streams input (rather than loading the whole\n"
+            "      file into RAM), uses canonical (strand-independent) k-mers, and is\n"
+            "      the tool the documented workflow is built around.\n");
 
     sequence_file = argv[optind];
 
@@ -332,6 +344,21 @@ int main(int argc, char *argv[]) {
     }
     printf("Total sequence length: %zu\n", total_length);
 
+    if (total_length < (size_t)k) {
+        fprintf(stderr, "Error: input contains %zu bases, fewer than k=%d. Nothing to count.\n",
+                total_length, k);
+        free(sequence);
+        free(default_output_file);
+        free(default_F_output_file);
+        return EXIT_FAILURE;
+    }
+
+    // One thread per chunk is pointless once chunks get shorter than k; cap the
+    // thread count so every thread receives a range that can hold at least one k-mer.
+    if ((size_t)num_threads > total_length / (size_t)k)
+        num_threads = (int)(total_length / (size_t)k);
+    if (num_threads < 1) num_threads = 1;
+
     // Initialize hash table and mutexes
     KmerNode **hash_table = init_hash_table();
     pthread_mutex_t mutexes[256]; // Use 256 mutexes for simplicity
@@ -353,7 +380,16 @@ int main(int argc, char *argv[]) {
         thread_data[i].hash_table = hash_table;
         thread_data[i].mutexes = mutexes;
         thread_data[i].start = i * chunk_size;
-        thread_data[i].end = (i == num_threads - 1) ? total_length - 1 : (i + 1) * chunk_size + k - 1;
+        // $end is an exclusive bound: a k-mer starting at j is counted while
+        // j + k <= end. Each chunk therefore overlaps the next by k-1 bases so that
+        // k-mers straddling a chunk boundary are still counted exactly once. The last
+        // chunk ends at total_length (not total_length - 1, which dropped the final
+        // k-mer) and every bound is clamped so it can never run past the buffer.
+        size_t chunk_end = (i == num_threads - 1)
+                         ? total_length
+                         : (size_t)(i + 1) * chunk_size + (size_t)k - 1;
+        if (chunk_end > total_length) chunk_end = total_length;
+        thread_data[i].end = chunk_end;
 
         if (pthread_create(&threads[i], NULL, count_kmers, &thread_data[i]) != 0) {
             perror("Thread creation failed");
@@ -431,6 +467,11 @@ int main(int argc, char *argv[]) {
                 node = node->next;
             }
         }
+
+        // Sort before writing. The in-loop qsort only ran once the buffer first filled
+        // to N, so a run that found fewer than N qualifying k-mers emitted them in
+        // hash-table order rather than ascending hash order.
+        qsort(top_kmers, top_count, sizeof(KmerCount), compare_kmer_hashes);
 
         // Output the top N k-mers to the specified file
         FILE *F_out = fopen(F_output_file, "w");

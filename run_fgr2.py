@@ -7,25 +7,55 @@ import glob
 import sys
 from concurrent.futures import ProcessPoolExecutor
 
-def process_file_group(input_file_group, group_index, options):
+def build_output_filename(input_file_group, group_index, options):
+    """Derive the .fgr2 output filename for a group of input files."""
+    first_file_basename = os.path.basename(input_file_group[0])
+    hash_suffix = "wang" if options['wang_hash'] else "mm3"
+    if len(input_file_group) > 1:
+        return f"{first_file_basename}_group{group_index + 1}.c{options['coverage']}.{hash_suffix}.fgr2"
+    return f"{first_file_basename}.c{options['coverage']}.{hash_suffix}.fgr2"
+
+
+def assign_output_filenames(grouped_files_list, options):
+    """
+    Build one output filename per group, guaranteeing uniqueness.
+
+    Names are derived from the first file's *basename*, so two inputs with the same
+    basename in different directories (e.g. runA/reads.fq and runB/reads.fq) would
+    otherwise map to the same .fgr2 file and silently overwrite each other.
+    """
+    names = []
+    used = set()
+    for idx, group in enumerate(grouped_files_list):
+        name = build_output_filename(group, idx, options)
+        if name in used:
+            stem, _, ext = name.rpartition('.fgr2')
+            candidate = f"{stem}_group{idx + 1}.fgr2"
+            suffix = 2
+            while candidate in used:
+                candidate = f"{stem}_group{idx + 1}_{suffix}.fgr2"
+                suffix += 1
+            print(f"Warning: output name '{name}' already used by another group; "
+                  f"writing '{candidate}' instead.", file=sys.stderr)
+            name = candidate
+        used.add(name)
+        names.append(name)
+    return names
+
+
+def process_file_group(input_file_group, group_index, options, output_filename=None):
     """Process a group of input files with a single fgr2 call"""
     if not input_file_group:
         print(f"Warning: Empty file group received for index {group_index}. Skipping.", file=sys.stderr)
         return False
-    
+
     first_file_in_group = input_file_group[0]
     first_file_basename = os.path.basename(first_file_in_group)
 
     try:
-        # Determine hash suffix for filename
-        hash_suffix = "wang" if options['wang_hash'] else "mm3"
+        if output_filename is None:
+            output_filename = build_output_filename(input_file_group, group_index, options)
 
-        # Create output filename
-        if len(input_file_group) > 1:
-            output_filename = f"{first_file_basename}_group{group_index + 1}.c{options['coverage']}.{hash_suffix}.fgr2"
-        else:
-            output_filename = f"{first_file_basename}.c{options['coverage']}.{hash_suffix}.fgr2"
-        
         # Get the directory where this script is located
         script_dir = os.path.dirname(os.path.abspath(__file__))
         
@@ -81,14 +111,26 @@ def main():
     parser.add_argument("-N", "--topn", type=int, default=10000, help="Number of top k-mers to include (default: 10000)")
     parser.add_argument("-w", "--wang-hash", action="store_true", help="Use Wang's hash function (default: MurmurHash3)")
     parser.add_argument("-p", "--parallel", type=int, default=1, help="Number of fgr2 processes to run in parallel (default: 1)")
-    parser.add_argument("-g", "--group-size", type=int, default=1, help="Number of input files per fgr2 call. Output files will have .mgr2 extension. (default: 1)")
-    
+    parser.add_argument("-g", "--group-size", type=int, default=1, help="Number of input files per fgr2 call. (default: 1)")
+
     args = parser.parse_args()
-    
+
     if args.group_size <= 0:
         print("Warning: --group-size must be positive. Defaulting to 1.", file=sys.stderr)
         args.group_size = 1
-        
+    if args.parallel < 1:
+        print("Warning: --parallel must be >= 1. Defaulting to 1.", file=sys.stderr)
+        args.parallel = 1
+    if args.topn < 1:
+        parser.error("--topn must be >= 1")
+    if args.threads < 1:
+        parser.error("--threads must be >= 1")
+    if not 1 <= args.kmer_size <= 31:
+        parser.error("--kmer-size must be between 1 and 31")
+    if args.coverage < 0:
+        parser.error("--coverage must be >= 0")
+
+
     expanded_files = []
     for pattern in args.input_files:
         matches = glob.glob(pattern)
@@ -125,11 +167,14 @@ def main():
         'wang_hash': args.wang_hash
     }
     
+    output_filenames = assign_output_filenames(grouped_files_list, options)
+
     success_count = 0
     if args.parallel > 1 and num_groups > 1:
         print(f"Processing up to {args.parallel} groups in parallel.")
-        # Prepare arguments for each task: (input_file_group, group_index, options_dict)
-        tasks = [(group, idx, options) for idx, group in enumerate(grouped_files_list)]
+        # Prepare arguments for each task: (input_file_group, group_index, options, out_name)
+        tasks = [(group, idx, options, output_filenames[idx])
+                 for idx, group in enumerate(grouped_files_list)]
         with ProcessPoolExecutor(max_workers=args.parallel) as executor:
             results = list(executor.map(_process_file_group_wrapper, tasks))
             success_count = sum(1 for r in results if r)
@@ -137,7 +182,7 @@ def main():
         if args.parallel > 1 and num_groups <=1:
             print("Note: Parallel processing > 1 specified, but only one group to process. Running sequentially.")
         for idx, group in enumerate(grouped_files_list):
-            if process_file_group(group, idx, options):
+            if process_file_group(group, idx, options, output_filenames[idx]):
                 success_count += 1
     
     print(f"Completed: {success_count}/{num_groups} groups processed successfully.")
