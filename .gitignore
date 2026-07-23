@@ -77,3 +77,24 @@ venv/
 finger_print_data
 
 aatest
+
+# --- Analysis outputs are manuscript evidence and MUST be tracked ---
+# The patterns above (*.png, *.fgr2, *.jac, *.cos, *.newick, *.hist) are aimed at
+# stray working files in the repo root. The analysis/ tree is the reproducibility
+# record backing the manuscript, so its scripts, figures and raw results are
+# re-included here. Note these are scoped re-includes rather than a blanket
+# `!analysis/**`, which would also resurrect __pycache__ and other build noise.
+!analysis/
+!analysis/scripts/
+!analysis/scripts/*.py
+!analysis/scripts/*.sh
+!analysis/figures/
+!analysis/figures/*.png
+!analysis/results/
+!analysis/results/*.json
+!analysis/results/*.txt
+
+# ...but never build noise, even under analysis/
+analysis/**/__pycache__/
+*.pyc
+
