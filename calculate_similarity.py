@@ -1,3 +1,54 @@
+"""
+Pairwise similarity between fgr/fgr2 bottom-N sketches, with dendrograms and
+Neighbor-Joining trees.
+
+ESTIMATORS AND THE LEGACY BIAS
+------------------------------
+An .fgr2 file is a bottom-N MinHash sketch: the N k-mers with the smallest hash
+values in that sample. Two sketches built INDEPENDENTLY from two samples are not
+samples from a common index, so set operations applied to them directly do not
+estimate the corresponding quantity on the full k-mer sets.
+
+* Jaccard. The historical estimator |S_A n S_B| / |S_A u S_B| ("direct") is NOT
+  a MinHash estimator. Its bias is a function of the ratio of the two samples'
+  distinct-k-mer counts and does NOT shrink as N grows. The correct construction
+  (Broder / Mash) merges the two sketches, keeps the N globally smallest hashes
+  of the merge -- which is exactly the bottom-N sketch of the TRUE union -- and
+  reports the fraction of those k-mers present in both sketches. That is the
+  default here (``jaccard_union``); ``--legacy-jaccard`` restores the old one.
+
+* Cosine. The historical estimator took the dot product over S_A n S_B while
+  taking each L2 norm over its own sketch, i.e. numerator and denominators lived
+  on different supports. This carries a multiplicative downward bias
+      E[cos_legacy] = cos_true / sqrt(r),   r = max(|A|,|B|) / min(|A|,|B|)
+  which also does not vanish with N. The default here puts the numerator and
+  BOTH norms on the bottom-N-of-union support, with absent k-mers contributing
+  coverage 0 (``cosine_union``); ``--legacy-cosine`` restores the old one.
+
+  WHERE THE COSINE FIX DOES AND DOES NOT HELP (measured, not assumed). The
+  correction is decisive when the two inputs differ in size: on a controlled
+  real-genome construction spanning r = 1.0-2.9 it cut mean bias from -0.131 to
+  -0.004 and RMSE from 0.165 to 0.019 (n = 280, paired Wilcoxon p = 1.5e-44).
+  But on the 120 natural pairs of 16 RefSeq genomes, where r only spans
+  1.006-1.561, the legacy cosine is NOT significantly worse (p = 0.891 at
+  N = 100, p = 0.225 at N = 10000); for whole bacterial genomes of similar size
+  the fix changes little. And in a READ-based regime with coverage filtering
+  disabled (-c 1), where the support is millions of distinct k-mers and N
+  samples ~0.3% of it, BOTH estimators fall far below the true cosine and the
+  corrected one was significantly LESS accurate than the legacy one
+  (p = 8.6e-09 at N = 10000). Rank order is preserved (Spearman ~0.97), so
+  relative comparisons survive, but neither value should be read as a point
+  estimate of the cosine in that regime. The corrected estimator is the default
+  because it is the one that is unbiased by construction and improves with N;
+  it is not uniformly better on every input.
+
+WARNING: similarity matrices produced with either legacy estimator are biased
+whenever the two inputs differ in size (number of distinct k-mers). The bias is
+small when the inputs are of comparable size -- e.g. whole bacterial genomes of
+similar length -- and grows with the size ratio. Published .jac/.cos matrices in
+this repository predate the fix; use the --legacy-* flags to reproduce them.
+"""
+
 import os
 import glob
 import math
@@ -41,9 +92,9 @@ try:
 except ImportError:
     pass
 
-def parse_fgr_file(filepath):
+def parse_sketch(filepath):
     """
-    Parses an .fgr/.fgr2 file.
+    Parses an .fgr/.fgr2 file into full sketch records, hash column included.
 
     The expected record format is three tab-separated columns:
         <kmer>\t<hash>\t<coverage>
@@ -52,12 +103,16 @@ def parse_fgr_file(filepath):
     parsed into the returned metadata dict so callers can verify that sketches
     were generated with compatible parameters.
 
+    The hash column is the sketch's sort key. It is REQUIRED by the bottom-N-of-
+    union estimators (``jaccard_union`` / ``cosine_union``), which is why it is
+    retained here rather than discarded as it was historically.
+
     Returns
     -------
-    (kmers, coverages, meta) on success, or (None, None, None) on failure.
+    (records, meta) on success, or (None, None) on failure, where ``records``
+    maps kmer -> (hash, coverage) with both values ints.
     """
-    kmers = set()
-    coverages = {}
+    records = {}
     meta = {}
     try:
         with open(filepath, 'r') as f:
@@ -85,25 +140,125 @@ def parse_fgr_file(filepath):
                     print(f"Warning: Could not parse coverage for k-mer '{kmer}' at line "
                           f"{lineno} in {filepath}. Skipping line.")
                     continue
-                kmers.add(kmer)
-                coverages[kmer] = coverage
+                try:
+                    hash_value = int(parts[1])
+                except ValueError:
+                    # A k-mer with no usable hash cannot be ranked, so it cannot
+                    # take part in the bottom-N-of-union construction. Dropping it
+                    # is safer than silently excluding it from the union support
+                    # while still counting it in the intersection.
+                    print(f"Warning: Could not parse hash for k-mer '{kmer}' at line "
+                          f"{lineno} in {filepath}. Skipping line.")
+                    continue
+                records[kmer] = (hash_value, coverage)
     except FileNotFoundError:
         print(f"Error: File not found {filepath}")
-        return None, None, None
+        return None, None
     except OSError as e:
         print(f"Error reading file {filepath}: {e}")
+        return None, None
+    return records, meta
+
+
+def parse_fgr_file(filepath):
+    """
+    Backwards-compatible view of :func:`parse_sketch`.
+
+    Returns ``(kmers, coverages, meta)`` exactly as it always has -- the hash
+    column is dropped. New code should call :func:`parse_sketch` instead, since
+    the corrected estimators need the hashes.
+
+    Returns (None, None, None) on failure.
+    """
+    records, meta = parse_sketch(filepath)
+    if records is None:
         return None, None, None
+    kmers = set(records)
+    coverages = {kmer: cov for kmer, (_h, cov) in records.items()}
     return kmers, coverages, meta
+
+
+def sketch_kmers(records):
+    """Set of k-mers in a sketch-record dict (kmer -> (hash, coverage))."""
+    return set(records)
+
+
+def sketch_coverages(records):
+    """kmer -> coverage view of a sketch-record dict."""
+    return {kmer: cov for kmer, (_h, cov) in records.items()}
+
 
 def jaccard_index(set1, set2):
     """
-    Calculates the Jaccard Index between two sets.
+    LEGACY (biased) Jaccard estimator: |A n B| / |A u B| applied directly to two
+    independently built bottom-N sketches.
+
+    This is NOT a MinHash estimator. Its bias is driven by the ratio of the two
+    samples' distinct-k-mer counts and does not shrink as N grows. Retained only
+    so ``--legacy-jaccard`` can reproduce previously published matrices; use
+    :func:`jaccard_union` for new work.
     """
     if not set1 and not set2:
         return 1.0
     intersection = len(set1.intersection(set2))
     union = len(set1.union(set2))
     return intersection / union if union != 0 else 0.0
+
+
+def union_support(records1, records2, n=None):
+    """
+    The bottom-N sketch of the TRUE union of the two samples' k-mer sets.
+
+    Merging the two sketches and keeping the ``n`` globally smallest hashes is
+    exact: a k-mer whose hash is among the n smallest of A u B must, if it is
+    present in sample A at all, already be among the n smallest of A -- so it is
+    guaranteed to be in sketch A and cannot be missed. Membership of the
+    resulting support in each sample is therefore fully determined by the two
+    sketches, with "absent from the sketch" meaning "absent from the sample".
+
+    ``n`` defaults to min(|S_A|, |S_B|), which equals the sketch size N whenever
+    both sketches are full and is the largest value for which the guarantee
+    above holds for both samples.
+
+    Ties in hash value are broken by k-mer string so the support -- and hence
+    every estimate built on it -- is symmetric in its two arguments.
+    """
+    merged = {}
+    for kmer, (h, _cov) in records1.items():
+        merged[kmer] = h
+    for kmer, (h, _cov) in records2.items():
+        merged[kmer] = h
+    if n is None:
+        n = min(len(records1), len(records2))
+    if n <= 0:
+        return []
+    return sorted(merged, key=lambda kmer: (merged[kmer], kmer))[:n]
+
+
+def jaccard_union(records1, records2, n=None):
+    """
+    Corrected (bottom-N-of-union) Jaccard estimator -- the Broder/Mash
+    construction, and the default in this tool.
+
+    Takes the bottom-N sketch of the union (see :func:`union_support`) and
+    reports the fraction of its k-mers present in BOTH samples. Because that
+    support is a uniform random sample of the true union, this is a consistent
+    estimator of |A n B| / |A u B| with error that shrinks as N grows.
+
+    Parameters
+    ----------
+    records1, records2 : dict
+        kmer -> (hash, coverage), as returned by :func:`parse_sketch`.
+    n : int, optional
+        Support size; defaults to min(|S_A|, |S_B|).
+    """
+    if not records1 and not records2:
+        return 1.0
+    support = union_support(records1, records2, n)
+    if not support:
+        return 0.0
+    shared = sum(1 for kmer in support if kmer in records1 and kmer in records2)
+    return shared / len(support)
 
 
 def resample_kmer_universe(all_unique_kmers_list):
@@ -133,14 +288,20 @@ def vector_norm(coverages):
 
 def cosine_similarity_manual(dict1, dict2, standardize=False, norm1=None, norm2=None):
     """
-    Calculates the Cosine Similarity between two k-mer coverage dictionaries.
+    LEGACY (biased) cosine estimator between two k-mer coverage dictionaries.
 
-    Vectors are indexed by the union of both k-mer sets, with k-mers absent from a
-    sample contributing 0. Because those absent entries contribute nothing to the
-    dot product, and each vector's norm depends only on its own dictionary, the
-    similarity is computed over just the *intersection* -- mathematically identical
-    to materialising the full union vectors, but O(|A n B|) instead of O(|A u B|)
-    and without allocating two lists per pair.
+    The dot product runs over A n B while each L2 norm runs over that sample's
+    own dictionary. On two FULL coverage vectors this is exact -- absent entries
+    contribute nothing to the dot product, so restricting it to the intersection
+    is an optimisation, not an approximation. On two independently built bottom-N
+    SKETCHES it is not: numerator and denominators are then estimated on
+    different supports, giving a multiplicative downward bias
+        E[cos_legacy] = cos_true / sqrt(r),  r = max(|A|,|B|) / min(|A|,|B|)
+    that does not vanish as N grows.
+
+    Retained for ``--legacy-cosine`` and for use on full (un-sketched) vectors,
+    where it remains exact. New sketch comparisons should use
+    :func:`cosine_union`.
 
     Parameters
     ----------
@@ -182,6 +343,47 @@ def cosine_similarity_manual(dict1, dict2, standardize=False, norm1=None, norm2=
             dot += float(value) * float(other)
 
     return dot / (norm1 * norm2)
+
+
+def cosine_union(records1, records2, n=None):
+    """
+    Corrected (bottom-N-of-union) cosine estimator -- the default in this tool.
+
+    The dot product AND both L2 norms are taken over one common, unbiasedly
+    sampled support: the bottom-N sketch of the true union (see
+    :func:`union_support`). A k-mer in the support that is absent from a sample
+    contributes coverage 0 to that sample's vector, which is exact -- see the
+    guarantee documented in :func:`union_support`.
+
+    Note that no precomputed per-sample norm can be reused here: each norm is
+    restricted to the pair's own union support, so it is pair-specific. This
+    makes the corrected cosine strictly more expensive than the legacy one.
+
+    Parameters
+    ----------
+    records1, records2 : dict
+        kmer -> (hash, coverage), as returned by :func:`parse_sketch`.
+    n : int, optional
+        Support size; defaults to min(|S_A|, |S_B|).
+    """
+    if not records1 and not records2:
+        return 1.0
+    support = union_support(records1, records2, n)
+    if not support:
+        return 0.0
+    dot = sum_aa = sum_bb = 0.0
+    for kmer in support:
+        rec_a = records1.get(kmer)
+        rec_b = records2.get(kmer)
+        a = float(rec_a[1]) if rec_a is not None else 0.0
+        b = float(rec_b[1]) if rec_b is not None else 0.0
+        dot += a * b
+        sum_aa += a * a
+        sum_bb += b * b
+    if sum_aa == 0 or sum_bb == 0:
+        return 0.0
+    return dot / math.sqrt(sum_aa * sum_bb)
+
 
 def write_matrix_to_file(matrix, filenames, output_filepath):
     """
@@ -337,10 +539,32 @@ def main():
     parser.add_argument("--bootstrap_replicates", type=int, default=100, help="Number of bootstrap replicates for Neighbor-Joining trees (default: 100). Only used if NJ trees are enabled.")
     parser.add_argument("--standardize", action="store_true", help="Deprecated no-op: cosine similarity is invariant under the positive rescaling this applied, so results are identical with or without it. Accepted for backwards compatibility.")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for bootstrap resampling, for reproducible support values.")
+    parser.add_argument("--legacy-jaccard", action="store_true", dest="legacy_jaccard",
+                        help="Use the old, biased direct Jaccard estimator "
+                             "|A n B| / |A u B| on the two raw sketches. Only for "
+                             "reproducing previously published .jac matrices.")
+    parser.add_argument("--legacy-cosine", action="store_true", dest="legacy_cosine",
+                        help="Use the old, biased cosine estimator (dot product over "
+                             "the intersection, each norm over its own sketch). Only "
+                             "for reproducing previously published .cos matrices.")
     args = parser.parse_args()
 
     if args.bootstrap_replicates < 0:
         parser.error("--bootstrap_replicates must be >= 0")
+
+    if args.legacy_jaccard or args.legacy_cosine:
+        which = " and ".join(
+            name for name, on in (("Jaccard", args.legacy_jaccard),
+                                  ("cosine", args.legacy_cosine)) if on)
+        print("*" * 78)
+        print(f"WARNING: LEGACY {which.upper()} ESTIMATOR(S) ENABLED -- RESULTS ARE BIASED.")
+        print("  The legacy estimators apply set/vector operations directly to two")
+        print("  INDEPENDENTLY built bottom-N sketches. They are not MinHash estimators.")
+        print("  Their bias is driven by the ratio of the two samples' distinct-k-mer")
+        print("  counts and does NOT shrink as the sketch size N grows. Sketches that")
+        print("  differ in size will be scored too low.")
+        print("  Use these flags only to reproduce matrices published before the fix.")
+        print("*" * 78)
 
     if args.standardize:
         print("NOTE: --standardize has no effect. Cosine similarity is invariant under the\n"
@@ -376,18 +600,22 @@ def main():
         file_basenames.append(basename)
     
     file_data = {}
+    file_records = {}
     file_meta = {}
     valid_file_paths = []
     for f_path in fgr_files_paths:
-        kmers, coverages, meta = parse_fgr_file(f_path)
-        if kmers is None or coverages is None:
+        records, meta = parse_sketch(f_path)
+        if records is None:
             continue
+        kmers = sketch_kmers(records)
+        coverages = sketch_coverages(records)
         if not kmers:
             # An empty sketch would compare as distance 0 to every other empty sketch
             # and as distance 1 to everything else, silently corrupting the tree.
             print(f"Warning: {os.path.basename(f_path)} contains no usable k-mers. Excluding it.")
             continue
         file_data[f_path] = (kmers, coverages)
+        file_records[f_path] = records
         file_meta[f_path] = meta
         valid_file_paths.append(f_path)
 
@@ -409,9 +637,15 @@ def main():
     name_to_idx = {name: i for i, name in enumerate(file_basenames)}
     num_files = len(file_basenames)
 
-    # Norms depend only on a sample's own coverages, so compute each once here rather
-    # than re-deriving them inside every pairwise cosine call.
-    file_norms = {p: vector_norm(file_data[p][1]) for p in valid_file_paths}
+    # Legacy-cosine only: norms depend solely on a sample's own coverages, so compute
+    # each once here rather than re-deriving them inside every pairwise call. The
+    # corrected cosine cannot reuse these -- its norms are restricted to the pair's
+    # own union support and are therefore pair-specific.
+    file_norms = ({p: vector_norm(file_data[p][1]) for p in valid_file_paths}
+                  if args.legacy_cosine else None)
+
+    print(f"\nJaccard estimator: {'LEGACY direct (biased)' if args.legacy_jaccard else 'bottom-N-of-union (default)'}")
+    print(f"Cosine estimator:  {'LEGACY intersection/own-norms (biased)' if args.legacy_cosine else 'bottom-N-of-union (default)'}")
 
     jaccard_matrix = np.zeros((num_files, num_files))
     cosine_matrix = np.zeros((num_files, num_files))
@@ -431,10 +665,17 @@ def main():
         idx1 = name_to_idx[os.path.basename(file1_path)]
         idx2 = name_to_idx[os.path.basename(file2_path)]
 
-        ji = jaccard_index(kmers1, kmers2)
-        cs = cosine_similarity_manual(coverages1, coverages2, args.standardize,
-                                      norm1=file_norms[file1_path],
-                                      norm2=file_norms[file2_path])
+        if args.legacy_jaccard:
+            ji = jaccard_index(kmers1, kmers2)
+        else:
+            ji = jaccard_union(file_records[file1_path], file_records[file2_path])
+
+        if args.legacy_cosine:
+            cs = cosine_similarity_manual(coverages1, coverages2, args.standardize,
+                                          norm1=file_norms[file1_path],
+                                          norm2=file_norms[file2_path])
+        else:
+            cs = cosine_union(file_records[file1_path], file_records[file2_path])
 
         jaccard_matrix[idx1, idx2] = ji
         jaccard_matrix[idx2, idx1] = ji
@@ -526,12 +767,23 @@ def main():
                         # replicate O(n^2 * |kmers|) instead of O(n * |kmers|).
                         kmers_boot = [file_data[p][0] & current_bootstrap_kmer_universe
                                       for p in valid_file_paths]
+                        # The corrected estimator needs the hashes as well, so the
+                        # resampled universe is applied to the full records too.
+                        records_boot = None
+                        if not args.legacy_jaccard:
+                            records_boot = [
+                                {k: v for k, v in file_records[p].items()
+                                 if k in current_bootstrap_kmer_universe}
+                                for p in valid_file_paths]
 
                         boot_j_distances = np.zeros((num_files, num_files))
 
                         for r_idx in range(num_files): # row index
                             for c_idx in range(r_idx + 1, num_files): # column index
-                                ji_boot = jaccard_index(kmers_boot[r_idx], kmers_boot[c_idx])
+                                if args.legacy_jaccard:
+                                    ji_boot = jaccard_index(kmers_boot[r_idx], kmers_boot[c_idx])
+                                else:
+                                    ji_boot = jaccard_union(records_boot[r_idx], records_boot[c_idx])
                                 dist_boot = 1.0 - ji_boot
 
                                 boot_j_distances[r_idx, c_idx] = dist_boot
@@ -600,18 +852,29 @@ def main():
 
                         # Filter each sample's coverages and derive its norm ONCE per
                         # replicate, rather than rebuilding both dicts for every pair.
-                        cov_boot = [{k: v for k, v in file_data[p][1].items()
-                                     if k in current_bootstrap_kmer_universe}
-                                    for p in valid_file_paths]
-                        norms_boot = [vector_norm(c) for c in cov_boot]
+                        if args.legacy_cosine:
+                            cov_boot = [{k: v for k, v in file_data[p][1].items()
+                                         if k in current_bootstrap_kmer_universe}
+                                        for p in valid_file_paths]
+                            norms_boot = [vector_norm(c) for c in cov_boot]
+                            records_boot_c = None
+                        else:
+                            records_boot_c = [
+                                {k: v for k, v in file_records[p].items()
+                                 if k in current_bootstrap_kmer_universe}
+                                for p in valid_file_paths]
 
                         boot_c_distances = np.zeros((num_files, num_files))
 
                         for r_idx in range(num_files): # row index
                             for c_idx in range(r_idx + 1, num_files): # column index
-                                cs_boot = cosine_similarity_manual(
-                                    cov_boot[r_idx], cov_boot[c_idx], args.standardize,
-                                    norm1=norms_boot[r_idx], norm2=norms_boot[c_idx])
+                                if args.legacy_cosine:
+                                    cs_boot = cosine_similarity_manual(
+                                        cov_boot[r_idx], cov_boot[c_idx], args.standardize,
+                                        norm1=norms_boot[r_idx], norm2=norms_boot[c_idx])
+                                else:
+                                    cs_boot = cosine_union(records_boot_c[r_idx],
+                                                           records_boot_c[c_idx])
                                 dist_boot = 1.0 - cs_boot
 
                                 boot_c_distances[r_idx, c_idx] = dist_boot
